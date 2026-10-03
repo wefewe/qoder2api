@@ -1,0 +1,54 @@
+name: Sync upstream source from shuishuipingan/qoder2api-hub
+
+# 上游：https://github.com/shuishuipingan/qoder2api-hub (MIT)。本 workflow 定时拉取其最新
+# Release tag 源码同步进 upstream/，有变化则提交，并显式 dispatch build.yml 重新构建镜像。
+on:
+  schedule:
+    - cron: '47 */2 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write   # 同步后显式 dispatch build.yml（workflow_dispatch 不受 GITHUB_TOKEN 触发限制）
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Fetch latest upstream tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth_header="Authorization: Bearer $GH_TOKEN"
+          tag=$(curl -sSL -H "$auth_header" https://api.github.com/repos/shuishuipingan/qoder2api-hub/releases/latest \
+            | python3 -c "import sys,json;d=json.load(sys.stdin);sys.exit(f'GitHub API error: {d}') if 'tag_name' not in d else print(d['tag_name'])")
+          echo "tag: $tag"
+          curl -sSL -H "$auth_header" -o /tmp/u.tgz "https://github.com/shuishuipingan/qoder2api-hub/archive/refs/tags/${tag}.tar.gz"
+          rm -rf /tmp/x && mkdir -p /tmp/x
+          tar xzf /tmp/u.tgz -C /tmp/x
+          src=$(find /tmp/x -maxdepth 1 -type d -name 'qoder2api-hub-*' | head -1)
+          test -n "$src" || { echo "source dir not found"; exit 1; }
+          rm -rf upstream && mkdir -p upstream
+          cp -a "$src"/. upstream/
+          rm -rf upstream/.github upstream/.git
+          echo "$tag" > upstream/UPSTREAM-TAG.txt
+
+      - name: Commit if changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -A -f
+            git commit -m "chore: sync upstream shuishuipingan/qoder2api-hub"
+            git push
+            echo "✅ upstream updated and pushed"
+            gh workflow run build.yml --repo "$GITHUB_REPOSITORY"
+          else
+            echo "✅ upstream already up to date"
+          fi

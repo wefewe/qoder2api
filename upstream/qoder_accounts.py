@@ -134,6 +134,20 @@ def desktop_version():
 # 注意：身份是**机器级**的（不同账号/不存在的账号 id 都返回同一份），
 # 因此按区域缓存即可，同一台机器上的多个账号共用是正确的。
 NATIVE_IDENTITY_TTL = 1800
+# machine_identity_source（及 campaigns().identity）的合法取值只有两种：
+#   "runtime-info" —— runtime-info.exe 原生桥给出真身份（native_machine_identity）
+#   "derived"      —— 无原生桥时的派生回退（desktop_headers）
+# 生产端一律使用本常量。历史上消费端（campaigns() 自愈条件）误写为 "native"，
+# 与生产端字面量不一致导致该分支永不命中（口径分裂 bug，已修）；"native" 仅
+# 作为历史/测试桩别名在消费端兼容，不得作为新的生产端取值。
+MACHINE_IDENTITY_NATIVE = "runtime-info"
+# desktop_headers() 本次实际是否携带 cosy-machine* 机器头（与"身份来源"
+# machine_identity_source 是两个正交维度，勿混用）：
+#   "native"  —— 本次发送了原生桥给出的全套六头
+#   "omitted" —— 本次未发送任何 cosy-machine* 头（无原生桥时的正确行为；
+#                issue #10 修复前会发派生假头，实测会被服务端整条过滤活动）
+MACHINE_HEADERS_NATIVE = "native"
+MACHINE_HEADERS_OMITTED = "omitted"
 _native_exe_cache = {}
 _native_ident_cache = {}
 
@@ -272,7 +286,7 @@ def native_machine_identity(realm, account_id, force=False):
                      "machineCode": code,
                      "vm": bool(vm_info.get("isVm")),
                      "vm_info": vm_info,
-                     "source": "runtime-info"}
+                     "source": MACHINE_IDENTITY_NATIVE}
     _native_ident_cache[realm] = (now, ident)
     return ident
 
@@ -282,6 +296,10 @@ CHECKIN_PROBE_TTL = 6 * 3600
 # 活动列表缓存 TTL：活动状态变化很慢（每日一轮），20 秒内复用可让看板切换视图
 # /账号不再等那 1–4 秒的上游请求；领取动作会强制绕过并立即失效缓存。
 CAMPAIGNS_TTL = 20
+
+# 活动平台 claim 请求之间的默认间隔（秒）：调用方（qoder_tasks.run_checkin）的
+# gap 未透传时的安全默认，保持「>= 1.0s 防风控」语义（见 qoder_tasks 模块声明）。
+CLAIM_GAP_DEFAULT = 1.0
 
 def campaign_label(c):
     """活动显示名：官方中文标题（placements content.zh.title）优先，其次 key。"""
@@ -503,8 +521,11 @@ class Account(object):
         # 活动列表短缓存 (at, payload)：该请求约 1–4 秒（上游最慢的一环），
         # 看板切换视图/账号会连续取，缓存后由"领取动作"显式失效。
         self._campaigns_cache = None
-        # 活动平台用的机器身份来源：native(官方原生桥) / derived(派生回退)
+        # 活动平台用的机器身份来源：runtime-info(官方原生桥) / derived(派生回退)
         self.machine_identity_source = "derived"
+        # 最近一次 desktop_headers() 实际是否携带 cosy-machine* 头：
+        # native / omitted（未构造过时按 omitted 保守处理）；与身份来源正交
+        self.machine_headers_state = MACHINE_HEADERS_OMITTED
 
     # -- 持久化 ------------------------------------------------------------
     def to_dict(self):
@@ -663,27 +684,60 @@ class Account(object):
           MachineType / MachineCode
 
         两层坑（都已踩过）：
-          1. 缺这些头 → 服务端不报错但返回**空活动列表**；
-          2. 机器身份用派生假值 → 列表里**静默少掉设备定向活动**
-             （"每日领取 100 Credits"），只有官方原生桥取到的真身份才完整。
-        因此这里优先用 runtime-info.exe 的真值，失败才回退稳定派生值。
+          1. 缺 UA / cosy-clienttype / cosy-version → 服务端不报错但返回
+             **空活动列表**（实测这三个是展示活动所必需）。
+          2. 机器头「半套」问题（issue #10，Linux/Docker 实测）：服务端把
+             **全套派生** cosy-machine* 六头判定为非官方客户端，把 CLAIMABLE 的
+             「每日领取 100 Credits」**整条过滤**，列表只剩 VIEW_DETAILS 类；
+             已领取账号不受影响（所以首次领取时最易误判为"本来就没活动"）。
+             逐头隔离实测：六头任一个**单独**出现 → 活动可见；六头全发 →
+             被过滤；去掉 machinetoken 或 machineid → 可见。
+        因此本函数的策略（issue #10 修复）：
+          - 原生桥给出真身份（machineToken 非空）→ 发全套六头，保持官方
+            客户端同款行为（真头是否额外解锁设备定向活动未验证，维持现状）；
+          - derived 分支（无原生桥，如 Linux/Docker）→ **一律不发** cosy-machine*
+            六头，只发 UA / cosy-clienttype / cosy-version。
+        machine_identity_source 依旧如实记录（看板与诊断在用）。
         """
         h = dict(self.headers())
         h["User-Agent"] = "Qoder"
         h["cosy-clienttype"] = DESKTOP_CLIENT_TYPE
         h["cosy-version"] = desktop_version()
         ident = native_machine_identity(self.realm, self.uid)
-        h["cosy-machineid"] = derive_id(self.uid, "machine")
-        h["cosy-machinetoken"] = ident.get("machineToken") or \
-            derive_machine_token(self.uid)
-        h["cosy-machinetype"] = ident.get("machineType") or \
-            derive_machine_type(self.uid)
-        h["cosy-machinecode"] = ident.get("machineCode") or \
-            derive_id(self.uid, "machinecode")
-        h["cosy-machineos"] = MACHINE_OS
-        h["cosy-machinehostname"] = MACHINE_HOSTNAME
+        if ident.get("machineToken"):
+            # 仅原生身份可用时发送机器头（issue #10：派生六头会被服务端判定
+            # 为非官方客户端并整条过滤 CLAIMABLE 活动；详见上方 docstring）。
+            h["cosy-machineid"] = derive_id(self.uid, "machine")
+            h["cosy-machinetoken"] = ident.get("machineToken") or \
+                derive_machine_token(self.uid)
+            h["cosy-machinetype"] = ident.get("machineType") or \
+                derive_machine_type(self.uid)
+            h["cosy-machinecode"] = ident.get("machineCode") or \
+                derive_id(self.uid, "machinecode")
+            h["cosy-machineos"] = MACHINE_OS
+            h["cosy-machinehostname"] = MACHINE_HOSTNAME
+            self.machine_headers_state = MACHINE_HEADERS_NATIVE
+        else:
+            # 无原生桥：一个机器头都不发（issue #10）。状态如实登记，供
+            # campaigns().machine_headers 与 INTL 已知限制提示使用。
+            self.machine_headers_state = MACHINE_HEADERS_OMITTED
         self.machine_identity_source = ident.get("source") or "derived"
         return h
+
+    def _machine_headers_hint(self):
+        """机器头状态相关的可读提示；当前只在 INTL + 未发送机器头时非空。
+
+        国际版服务端要求真实的 UMID 机器身份（官方客户端组件生成、每 50 分钟
+        刷新）。本机无该组件时必须"不发头"（issue #10），服务端可能因此不返回
+        活动——这是**已知限制**，不要误报成"今天没有活动"。CN 侧不发头是正确
+        行为，不给提示。
+        """
+        if self.realm == "intl" and \
+                getattr(self, "machine_headers_state", "") == MACHINE_HEADERS_OMITTED:
+            return ("国际版服务端要求真实的 UMID 机器身份（由官方客户端组件生成、"
+                    "每 50 分钟刷新），本机没有该组件、本次未发送机器头：活动列表"
+                    "可能不可见、领取可能失败。这是已知限制，不等于今天没有活动。")
+        return ""
 
     # -- 刷新（按 token 前缀路由） ----------------------------------------
     def refresh(self):
@@ -946,15 +1000,29 @@ class Account(object):
                 and now - self._campaigns_cache[0] < CAMPAIGNS_TTL:
             return self._campaigns_cache[1]
         q, code, err = self._campaigns_get()
+        # 自愈条件必须与生产端同源：machine_identity_source 的合法值是
+        # MACHINE_IDENTITY_NATIVE("runtime-info") 或 "derived"；"native" 仅为
+        # 历史/测试桩别名。此前误用 native 字面量做等值判断，导致此分支永不命中
+        # （口径分裂，已按 Lead 裁决统一到 runtime-info）。
+        # 取舍留痕（勿误读为漏写）：此处**不做**缓存新鲜度节流。曾评估"仅当
+        # _native_ident_cache 缺失或 ≥NATIVE_IDENTITY_TTL 才自愈"的方案，未采纳：
+        # 该阈值会在"缓存新鲜但身份已被服务端作废"时阻止自愈，把用户重新打回
+        # "整天领不到"的原始故障；宁可多一次刷新（原生桥实测 3.7s，且触发条件
+        # 仅为服务端明确返回 showCampaign=false、并非高频路径），也不制造
+        # "为什么没自愈"的新谜题（Lead 裁决，不实施）。
         if isinstance(q, dict) and not q.get("showCampaign") \
-                and getattr(self, "machine_identity_source", "") == "native":
+                and getattr(self, "machine_identity_source", "") in \
+                (MACHINE_IDENTITY_NATIVE, "native"):
             native_machine_identity(self.realm, self.uid, force=True)
             q2, code2, err2 = self._campaigns_get()
             if isinstance(q2, dict) and q2.get("showCampaign"):
                 q, code, err = q2, code2, err2
         if not isinstance(q, dict):
             return {"ok": False, "available": code not in (404, 405, 410),
-                    "error": err or ("HTTP %d" % code)}
+                    "error": err or ("HTTP %d" % code),
+                    "machine_headers": getattr(self, "machine_headers_state",
+                                               MACHINE_HEADERS_OMITTED),
+                    "hint": self._machine_headers_hint()}
         items = []
         raw = q.get("campaigns")
         for c in (raw if isinstance(raw, list) else []):
@@ -1006,8 +1074,14 @@ class Account(object):
             "claimable": bool(q.get("claimable")),
             "campaign_url": str(q.get("campaignUrl") or ""),
             "campaigns": items,
-            # 机器身份来源：derived 时设备定向活动可能被服务端过滤（列表偏少）
+            # 身份来源（runtime-info=原生桥 / derived=派生回退；与下面的
+            # machine_headers 正交——derived 时本次根本不发机器头，issue #10）
             "identity": getattr(self, "machine_identity_source", "derived"),
+            # 本次实际是否携带 cosy-machine* 机器头：native / omitted
+            "machine_headers": getattr(self, "machine_headers_state",
+                                       MACHINE_HEADERS_OMITTED),
+            # INTL+omitted 时的"已知限制"提示；其余场景为空串（CN 不发提示）
+            "hint": self._machine_headers_hint(),
         }
         self.campaign_status = st
         self._campaigns_cache = (time.time(), st)
@@ -1098,7 +1172,7 @@ class Account(object):
     # 兼容类内调用：self.campaign_label(c) / qoder_accounts.campaign_label(c)
     campaign_label = staticmethod(campaign_label)
 
-    def campaign_checkin(self, gap=0.5, only_kinds=None):
+    def campaign_checkin(self, gap=None, only_kinds=None):
         """活动平台签到：领取所有 CLAIMABLE 的 Credits 活动（每日 100 等）。
 
         先强制刷新原生机器身份（身份会轮换，缓存过期会让列表被过滤 → 漏领），
@@ -1106,11 +1180,14 @@ class Account(object):
 
         only_kinds: 只领这些 benefit.kind 的活动（如 ("", "CREDITS") 表示只做
                     每日签到领积分，不动兑换码/券类福利）。
+        gap: 相邻两次 claim 请求之间的间隔（秒）；None=使用模块级安全默认
+             CLAIM_GAP_DEFAULT（>=1.0s），显式传入时按传入值（下限 0）。
 
         返回 {ok, claimed:[...], already:[...], earned, message, campaigns}
           - 已是 CLAIMED 的活动计入 already（"今日已领取"）
           - 无可领取项且没有任何活动 -> ok=True + message 说明
         """
+        claim_gap = CLAIM_GAP_DEFAULT if gap is None else max(0.0, float(gap))
         native_machine_identity(self.realm, self.uid, force=True)
         st = self.campaigns(force=True)      # 领取路径必须绕过缓存，看最新状态
         if not st.get("ok"):
@@ -1166,7 +1243,6 @@ class Account(object):
                 if res.get("redemption_code"):
                     codes.append({"campaign": label,
                                   "code": res["redemption_code"]})
-                time.sleep(max(0.0, gap))
             elif res.get("blocked"):
                 # 服务端按"人"去重：同机器/同身份下其他账号本轮已领。
                 # 记 6 小时冷却（多账号同机器时不必每轮都试），并保留原因。
@@ -1182,6 +1258,9 @@ class Account(object):
                 slot.append(c)
             else:
                 errors.append("%s: %s" % (cname, res.get("error")))
+            # 每个 claim 请求之后统一等待一次：成功/被挡/失败都刚打过上游，
+            # 相邻请求间隔由 gap 保证（默认 CLAIM_GAP_DEFAULT，防风控）。
+            time.sleep(claim_gap)
         if claimed:
             msg = "活动领取成功 +%d Credits（%s）" % (
                 earned, "、".join(self.campaign_label(c) for c in claimed))
@@ -2082,9 +2161,6 @@ def import_desktop_credential(path=None, realm=None):
 EXPORT_FORMAT = "qoder-accounts"
 EXPORT_VERSION = 1
 
-# 描述运行期状态而非凭证本身的字段：导入时导出可查、但绝不信任。
-VOLATILE_FIELDS = ("cooldownUntil", "lastError", "credits", "lastCheckin", "plan")
-
 
 def account_to_export(account):
     data = account.to_dict()
@@ -2148,7 +2224,11 @@ def _coerce_account_rows(blob):
 
 
 def normalise_import_row(row, realm=None):
-    """把一行导入数据规整成 Account kwargs；无可用凭证时 raise ValueError。"""
+    """把一行导入数据规整成 Account kwargs；无可用凭证时 raise ValueError。
+
+    运行期字段（cooldownUntil/lastError/credits/lastCheckin/plan）不随导入采信：
+    返回值只构造凭证与身份字段，运行期状态一律重置或缺失（白名单构造）。
+    """
     auth = row.get("auth") if isinstance(row.get("auth"), dict) else None
     profile = row.get("account") if isinstance(row.get("account"), dict) else None
 

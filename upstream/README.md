@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.2.3-2496ED?style=flat-square" alt="Version 1.2.3">
+  <img src="https://img.shields.io/badge/Release-v1.2.9-2496ED?style=flat-square" alt="Version 1.2.9">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -380,6 +380,113 @@ python _verify_models.py --base http://127.0.0.1:8790
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
 
+### v1.2.9
+
+**✨ 新增功能**：无
+
+**🐛 问题修复**
+- **设置页「复制 API Key」会闪退到登录界面**（点复制 → 弹出登录遮罩、复制失败）：前端把 HTTP **403** 与 **401** 等同处理，而`/settings/reveal` 在「面板仍使用默认密码」时返回 403 是**正确的安全守卫**（默认口令等于没有口令，不该交出明文 Key）。现改为**分流**：401 仍跳登录；**403 保留会话**，并把服务端消息原样提示（「面板仍在使用默认密码……请先在「设置 → 面板密码」修改密码，再查看明文 Key」）。
+
+**🎨 体验优化**
+- 切换出口失败、领福利失败两处从阻塞式 `alert()` 改为与全站一致的 `toast()`（文案未变；按钮不再被对话框吊住，失败后可立即重试）。
+
+**⚠️ 其他变更**
+- 清理无调用方的死代码：`filterRealm()`、`window.REALM_FILTER`、三条 `.realm-filter` CSS（原先引用已不存在的元素）。
+- 为 `throwPanelAuthError` 补充参数契约注释（传 `parsedBody` 即视为响应流已被消费）。
+- 文档：上一版 changelog 已改为四类格式。
+
+**验证（本轮）**
+- 前端：离线仿真矩阵（401/403 × getJSON/postJSON/downloadExport）**403 违反数 0 / 401 违反数 0**，且**改动前同一脚本会红**（违反数各 3）——断言有效；
+- 真实端到端：临时实例 + 账号副本，默认密码登录 → `/settings/reveal` 实测 403 且 body 带可操作消息，前端能读到；
+- 静态：语法解析 OK、82 个内联 handler / 57 个被调函数无缺失、残留计数全 0；
+- 时序：alert→toast 那处的 `finally` 语义经独立分析**确认无竞态**。
+
+**已知行为（非缺陷）**：默认面板密码下，唯一被挡的就是「复制明文 Key」——这是刻意设计；`/panel/password` 没有默认密码守卫，所以**不会锁死**，改密后即可复制。
+
+### v1.2.8
+
+> 本版**无功能变更**（v1.2.7 之后仅有测试与文档改动）。
+
+**✨ 新增功能**：无 ・ **🐛 问题修复**：无 ・ **🎨 体验优化**：无
+
+**⚠️ 其他变更**
+
+- **issue #16 复查**：把双方标注的「未覆盖形态」全部测掉——长链 13 帧、三种反转（散文里讨论标记 / 前缀被打断 / 完整标记后接散文）、代理对半截、双重转义、`\u63a` 分帧、窗口边界 16/17/18、暂存上限内外、与结构化直传的交互——**全部符合预期，无新问题**。
+- **修正一处判断**：此前以为「暂存窗口只是优化项」（把 `_MARKER_HOLD_WINDOW` 压到 1 时没有任何断言变红）。实测**不成立**——当帧**在标记中间被切开、且前面带散文**时，窗口=1 会**真实泄漏**。已补上该形态的回归断言：窗口值再被误改小会立即变红。
+- 顺带补齐 3 条暂存上限断言 + 17 条复查断言。
+- 基线：**587 checks, 584 passed, 0 failed, 3 skipped, exit 0**。
+
+### v1.2.7
+
+**修复 issue #16：回读守卫的两个边界形态**（作者附了可直接运行的探针脚本，两个形态都稳定复现）**
+
+- **B1｜散文与 marker 落进同一个 delta**：暂存此前只在「整帧以 marker 开头」时启动。而服务端的 delta 切分不可控——散文与 marker 被合并进同一帧时整帧会被透传。现在改为**在首个完整标记处切分**：标记之前的散文**立即发出**（不拖首字延迟），标记及其后进入暂存；同时补上**跨帧**处理（帧尾 17 字符内的标记真前缀暂留到下一帧再判定，证伪立即补发）。
+- **B2｜散文与 marker 分帧**：此前行为已正确，本次保留并补断言。
+- **B3｜截断落在未写完的 `\uXXXX` 转义里**：`_json_array_prefix_ok()` 原先只认「语法错误点落在末尾」，而 `Invalid \uXXXX escape` 的报错位置在转义串中间 → 判为不可扩展 → 不吞。现已补上该分支（并按实测修正：Python 3.13 的 `JSONDecodeError.pos` 指向 `u` 本身而非反斜杠，两个位置都要检查）。
+- **顺手修掉一个既有缺陷**（被本次 hold 扩展放大了触发面）：收尾帧的重发路径存的是**原帧**，当该帧内容已进入暂存（被吞或已补发）后，流末重发会把同一段再输出一次——表现为**正常文本以 `[` 或标记前缀结尾时，下一帧内容被输出两次**（如 `数组：\n[` + `1,2,3]` → `数组：\n[1,2,3]1,2,3]`）。这条是质检环节专门构造「误伤用例」时抓到的。
+- **新增暂存上限保护**：窗口固定为最长标记长度 − 1（17 字符），不会因正常文本长期以 `[` 开头而无限增长（有断言覆盖「长文本分帧后全部放行不丢字」）。
+- 新增 16 条断言（五形态 / 判据单元 / 误伤边界 ×6 / 窗口常量 / 非流式 / Responses / 暂存上限）+ 3 条变异反证（其中把本次修复退化为原样 → 重复输出立刻复现，证明回归网有效）。基线：**587 checks, 566 passed, 0 failed, 3 skipped, exit 0**。
+
+### v1.2.6
+
+**新增：结构化工具历史直传（针对 issue #8 / #11 类「模型复述内部信封」的根治方向）**
+
+- **背景**：issue #8 / #11 的根因是模型会模仿它在上下文里反复看到的格式。协议层评估的结论是——**换信封无法根治**（旧信封会随历史重放，换一次只多一层守卫），真正的对策是「**不再把工具历史文本化**」。本版本实现了这条路线。
+- **实测依据**（14 个真实上游请求的验证矩阵）：现有 SSE 端点**接受**结构化工具历史且**模型确实消费**——覆盖 3 轮连续工具链、结构化与旧文本信封**混合历史**、2 个并行 `tool_calls`、`tool_call_id` 不匹配、缺 tool 结果等形态。
+- **行为**：`flatten_messages()` 新增结构化分支——
+  - `tool` 消息 → `{role:"tool", tool_call_id, content}`；
+  - `assistant` + `tool_calls` → `{role:"assistant", content:"", tool_calls:[…]}`；
+  - **`content` 一律用空字符串、绝不用 `null`** —— 实测 `null` 会让上游转换层丢掉那条 assistant 消息，DeepSeek / Kimi 会直接拒绝（`Messages with role 'tool' must be a response to a preceding message with 'tool_calls'`）；
+  - `tool_call_id` 不齐备时**整请求回退文本化**（fail-safe：宁可少用，也不发畸形请求）。
+- **开关与灰度**：`QD_STRUCTURED_TOOL_HISTORY` 三态（`on` / `off` / `auto`，默认 **auto**）。auto 只在「**CN 出口 + provider 白名单（qwen / glm / gm4 / gm5）+ id 齐备**」时启用；DeepSeek / Kimi 与全部 INTL 暂排除在 auto 之外（前者待补端到端、后者该通道未实测），需要时可 `on` 强制放行。
+- **保留全部回读守卫**：其他 provider 仍在文本化，结构化路径异常也有兜底（既有守卫一行未改）。
+- **端到端实测**（网关实跑）：auto + Qwen3.8-Flash 结构化路径 → 200 且答对，日志打出 `structured tool history: ON`；`off` 一键回退同样 200 且答对。
+- 回退：`QD_STRUCTURED_TOOL_HISTORY=off`。
+
+**新增：上游「藏在 200 信封里」的错误现在可见**
+
+- 上游有时把错误塞在 HTTP 200 的 SSE **内层**（如 `provider_error` 内嵌 `invalid_request_error`）。此前网关没有任何提示，上游收紧时用户只会看到 200 的空正文。
+- 现在：内层错误按类别（content_policy / rate_limit / invalid_request / auth / other）**进程级计数**，并按类别**首次**打一条 WARN（`upstream error hidden in HTTP 200 envelope: …`）；计数可通过 `/usage/perf` 的 `inner_errors` 字段查看。
+- **零行为改动**：清洗、透传、重试、错误映射全部原样（有断言固定）。
+
+**测试**：587 checks / 541 passed / 0 failed / 3 skipped（本轮新增 13 条断言 + 2 条变异反证）。
+
+### v1.2.5
+
+**新增：历史工具结果削减（降低模型复述内部信封的概率 + 大幅省 token）**
+
+- **背景**：issue #8 / #11 的根因是「模型会模仿它在上下文里反复看到的格式」。协议层评估的结论是——换信封**不能根治**（旧信封仍会随历史重放，换一次只多一层守卫），真正的对策是「不再文本化」或「大幅减少暴露」。本版本做后者。
+- **行为**：历史里的工具结果（`[工具结果<name>]…`）在进入上游上下文前做**首尾保留 + 中间省略**：
+  - **只削历史**：最后一条 user/system 消息之后（即当前轮）的工具结果**全文保留**——模型正在用的内容不受影响；
+  - **信封前缀逐字节不变**（`[工具结果<name>]\n`），因此既有回读守卫与历史兼容性不受影响；
+  - ≤4.2 KB 的结果**不削**（绝大多数 `ls` / `cat` / `grep` 输出都在此列）；完整 JSON ≤8 KB 也不削（保可解析）；
+  - 省略处插入明确标记（含「需要完整内容请重新执行该命令」的行动指引），避免模型把截断处当成残缺数据去揣测。
+- **开关**：`QD_TOOL_RESULT_KEEP` —— 正数 = 单侧保留字符数；`0` / `off` / `false` = 完全关闭（回退旧行为）；非法值走默认 **2000**。
+- **实测收益**：15 条 8 KB 工具结果 → 117 KB 降到 59 KB（**-49%**）；30 条 20 KB → 585 KB 降到 118 KB（**-80%**）。
+- **已知代价**：diff 的中间 hunk、>8 KB JSON 的中段会被省略（靠省略标记 + JSON 双倍预算缓解）。
+- 新增 10 条断言（削减逻辑 / 首尾保留 / 前缀不变 / 当前轮不削 / 短结果 / JSON / 开关三态 / 默认值）。当前基线：**587 checks, 510 passed, 0 failed, 3 skipped, exit 0**。
+
+### v1.2.4
+
+**修复 issue #12：Docker 里提取出的 UMID 组件跑不起来（alpine 缺 glibc 兼容层）**
+
+- **现象**：v1.2.3 的组件提取在宿主上正常，但在 alpine 镜像里**执行失败**——`exit 127`，观感像「文件不存在」，实际是组件在、执行位也对、**exec 失败**。
+- **根因**（真 Docker 实测）：提取出的 `runtime-info` 是 **glibc 动态链接**的 ELF，依赖 `/lib64/ld-linux-x86-64.so.2` 与 `libstdc++.so.6`；而 alpine 是 musl，两者都不存在。
+- **修复**：运行时阶段的 `apk add` 增加 `gcompat libstdc++ libgcc`（约 +3.1 MB）。实测：装包后同一二进制 `exit=0` 并返回真实身份；`docker build` 成功，容器内 `/app/umid/runtime-info` 可直接执行。
+- **错误可见性**：`run_runtime_info()` 不再静默吞异常——「组件不存在」（正常降级，静默）与「组件在但跑不起来」（stderr 打一次 `[runtime-info] 无法执行 …` 并提示 alpine 需要 gcompat）现在**可区分**，同一类失败每进程只提示一次。
+- **能力边界补充（社区实测证实）**：
+  - Docker 里的身份是**容器级**而非机器级：同一容器内稳定，但**每新建一个容器就换一套身份**——重建容器等于换设备；需要身份稳定请复用容器（`docker start` / `docker compose start`，而不是 `-d --build`）。
+  - `vmInfo.brand` **不是固定值**（`Docker` / `KVM` 都出现过），判断虚拟化只看 `isVm` / `vmTypeCode`。
+  - v1.2.1 当时标注「未验证」的「真机器头可能额外解锁设备定向活动」**已被证实**：装上兼容层让组件真正可执行后，国内版「新人任务」活动从**不可见变为可见**。
+
+**修复 issue #11：`[工具结果…]` 标记的回读缺失**
+
+- **现象**：网关把 tool 消息序列化成 `[工具结果<name>]\n<内容>` 写进历史，但回读守卫只覆盖 `[assistant 请求调用工具]`。模型照格式复述时，这段内部文本会**原样透传**给终端用户，并进入会话历史继续被放大（与 issue #8 同机制）。
+- **修复**：新增 `TOOL_RESULT_MARKER` / `TOOL_RESULT_CLOSE` 常量（写入侧改为引用常量，**写出的字节逐字节不变**），并按 issue #9 的同形态守卫补上回读——覆盖两种回声形态：网关原格式与**模型自造的开闭对**（`[工具结果] … [工具结果结束]`）。三条 finalize 路径全覆盖；截断 / 只有开标记同样吞掉；讨论该标记的散文、未声明 tools 一律不吞（fail-open 保持）。
+- **取舍**：吞掉（空 content + `finish_reason=stop`），**不**还原成 tool 消息——后者需要 `tool_call_id` 配对，属协议层重构，注释里已记下这条更根本的方向。
+
+**测试与验证**：`python _test_qoder.py` → **587 checks, 500 passed, 0 failed, 3 skipped, exit 0**（新增 [31] 段 21 条 + 3 条变异反证）；**Docker 实测**：3 次构建 + 容器内验证，含「容器内直接执行组件拿到真实身份」与「同容器稳定 / 新容器换身份」的对照。
+
 ### v1.2.3
 
 **从 `@qoder-ai/qodercli` 提取内嵌 UMID 组件，让 Linux / Docker 部署也能拿到真实机器身份**
@@ -390,7 +497,7 @@ python _verify_models.py --base http://127.0.0.1:8790
 - **接入**：`runtime_info_exe()` 在 POSIX 上新增查找路径 `$QD_UMID_DIR/runtime-info` 与 `<repo>/umid/runtime-info`（桌面客户端路径仍优先，**Windows 行为逐字不变**）；调用契约与官方桌面端二进制完全一致（`prod --account-stdin`），调用侧无需改动。
 - **容器**：Dockerfile 改为**构建期多阶段提取**（builder 用 `python:3.11-alpine`，不需要 node；31 MB 的 npm 包不进最终镜像，只多 652 KB 组件），按 `TARGETARCH` 支持 amd64/arm64；提取失败不阻断构建（退化为 `omitted` 而非报错），脚本本身也 COPY 进镜像以便运行期补救。
 - **实测验证**：在 WSL 里真实执行提取出的组件，返回 `machineToken` / `machineType` / `machineCode` / `vmInfo`；连续三次调用身份字段逐字节一致。
-- **明确的能力边界（重要）**：该组件输出的是**机器级**身份，与 `account` 参数无关——不同账号 / 空账号 / 不同 `HOME` / 不同 `XDG_CONFIG_HOME` 全部返回**同一个** `machineToken`，且组件没有 CLI 开关、环境变量或状态文件可以影响它。所以本期**解决的是「Linux 部署拿不到真身份」**，**不是**「同一台机器多账号都能领」——后者是上游按设备去重的策略，需要不同的机器（详见「已知限制」）。
+- **明确的能力边界（重要）**：该组件输出的是**机器级**身份，与 `account` 参数无关——不同账号 / 空账号 / 不同 `HOME` / 不同 `XDG_CONFIG_HOME` 全部返回**同一个** `machineToken`，且组件没有 CLI 开关、环境变量或状态文件可以影响它。所以本期**解决的是「Linux 部署拿不到真身份」**，**不是**「同一台机器多账号都能领」——后者是上游按设备去重的策略，需要不同的机器（详见「已知限制」）。⚠️ Docker 场景的补充实测（issue #12）：容器里该身份实为**容器级**——同一容器内稳定，但**每个新建容器会换一套身份**，重建容器等于换了设备；详见「已知限制」第 1 节。
 - 新增 [30] 段 21 条断言（格式/架构识别、平台映射、体积启发式、base64 扫描、integrity 与 magic 双重校验、幂等、端到端全链路、跨模块契约）+ 3 条变异反证。当前基线：**482 checks, 479 passed, 0 failed, 3 skipped, exit 0**。
 
 ### v1.2.2
@@ -418,7 +525,7 @@ python _verify_models.py --base http://127.0.0.1:8790
 
 - **现象**（Linux/Docker 部署）：容器里没有官方风控桥 `runtime-info.exe` → 取不到原生身份 → 网关仍发出**派生**的 `cosy-machine*` 六头 → 服务端把**可领取状态**的 Credits 活动整条过滤掉，列表只剩详情类活动；旧 sash 兜底又是 `DISABLED`，于是 `run_checkin` 返回 `ok=True`、面板显示「签到成功」，而额度一动不动。
 - **根因**由 issue 作者逐头隔离实测定位：六个机器头**单独任一个**出现时活动可见，**全套一起发**即被过滤（去掉 `machinetoken` 或 `machineid` 后恢复可见）。
-- **修法**：`desktop_headers()` 仅在**原生身份可用**（`machineToken` 非空）时才发送六个 `cosy-machine*` 头；derived 分支一律不发，但 `User-Agent: Qoder` / `cosy-clienttype` / `cosy-version` 照发（这三个是服务端展示活动所必需的）。native 分支行为逐字未动——不影响「真机器头可能额外解锁设备定向活动」这条尚未验证的路径。
+- **修法**：`desktop_headers()` 仅在**原生身份可用**（`machineToken` 非空）时才发送六个 `cosy-machine*` 头；derived 分支一律不发，但 `User-Agent: Qoder` / `cosy-clienttype` / `cosy-version` 照发（这三个是服务端展示活动所必需的）。native 分支行为逐字未动——不影响「真机器头可能额外解锁设备定向活动」这条尚未验证的路径。（**后续证实**：该路径已被社区实测验证——装上 glibc 兼容层让组件在容器里真正可执行后，国内版「新人任务」活动从不可见变为可见；见 issue #12 与「已知限制」。）
 - **顺带修掉一个相邻死逻辑**：身份自愈分支写成 `source == "native"`，而该字段的真实取值只有 `runtime-info` / `derived`（源码里根本不存在 `native`）→ 自愈从未触发过。现统一到常量 `MACHINE_IDENTITY_NATIVE`，消费端保留历史别名兼容；探针实证：修复前同输入只发 1 次请求（死逻辑），修复后发 2 次并强制刷新身份。
 - `_diag_campaign.py` 的「活动平台」行补一条直白提示——当前身份是否携带机器头，避免再出现需要翻源码才能解释的「签到成功但没到账」。
 - 新增**双向**回归断言：derived 分支**不得**出现六头、原生分支**必须**齐发。
@@ -605,13 +712,20 @@ python _install_umid.py          # 从官方 npm 包提取内嵌的原生 UMID �
 >
 > 诊断：跑 `python _diag_campaign.py`，看「活动平台」行的两个维度——`身份来源`（身份从哪来）与 `本次机器头`（这次到底发没发）。
 
+**Docker / 容器部署的补充实测（issue #12，社区实测）**：
+
+- **容器里的身份是「容器级」而不是机器级**：同一容器内多次调用身份字段逐字节一致，但**每新建一个容器就会换一套身份**（两个独立容器结果不同）。含义：`docker compose up -d --build` 这类**重建**会更换设备身份，上游按设备去重的「每台设备每日 1 个国际版账号可领」会因此意外变化（重建后可能被当作「新设备」）。需要身份稳定时请**复用同一容器**（`docker start` / `docker compose start`，而不是重建）。
+- **alpine 镜像需要 glibc 兼容层**：提取出的组件是 glibc 动态链接的 ELF（依赖 `libstdc++`），而 alpine 是 musl——缺 `/lib64/ld-linux-x86-64.so.2` 与 `libstdc++.so.6` 时 exec 会直接失败（`exit 127`，观感像「文件不存在」，实为组件在但跑不起来）。本仓 Dockerfile 已内置 `apk add gcompat libstdc++ libgcc`（约 +3.1 MB）；自建镜像请照做。这类执行失败现在会在 stderr 打印一次 `[runtime-info] 无法执行 …`，与「组件不存在」的静默回退可区分。
+- **虚拟化字段的写法**：组件返回的 `vmInfo.brand` **不是固定值**（实测：一次性容器里可能是 `Docker`、完整构建的镜像里可能是 `KVM`）——判断虚拟化只看 `isVm`（或 `vmTypeCode`），不要把 `brand` 当常量引用。
+- **一条已被证实的路径**：让组件真正可执行（装兼容包）后，国内版「新人任务」活动从**不可见变为可见**——v1.2.1 当时标注「未验证」的「真机器头可能额外解锁设备定向活动」由此被社区实测证实。
+
 ### 2. 官方 fixture 缺失时部分密码学 KAT 会跳过
 
 离线测试里依赖官方协议 fixture 的 3 条断言在缺 fixture 时**显式 SKIP**（打印 `[SKIP]` 与候选清单，绝不静默；退出码不受影响）。用 `QD_TEST_FIXTURE_DIR` 指向目录即可执行完整 KAT。
 
-### 3. 容器构建与真实上游链路未经端到端验证
+### 3. 真实上游链路未经端到端验证
 
-本轮发布的改动经过：离线确定性测试（482 断言）、模块级 `py_compile`、静态核对与变异反证；但 **Docker 构建/运行**（本机 daemon 未运行）与**真实上游端到端**未在发布环境实跑。请以你自己的部署环境验证为准。
+本轮发布的改动经过：离线确定性测试（587 断言）、模块级 `py_compile`、静态核对与变异反证；**Docker 构建与容器内 UMID 组件执行**已在 Docker Desktop 29.7.2 实测（issue #12：`docker build` 成功 → 容器内 `/app/umid/runtime-info` 可执行并返回真实身份字段）。**真实上游端到端**仍未在发布环境实跑，请以你自己的部署环境验证为准。
 
 ---
 

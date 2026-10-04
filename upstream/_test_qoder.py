@@ -2787,6 +2787,267 @@ check("流式：证伪（marker 后接散文）-> 仍 fail-open 补发原文",
       _M27 in _text_falsify and "解释文字" in _text_falsify, _text_falsify)
 
 print()
+print("[27.6] 写入侧暴露面削减（历史工具结果首尾保留 + 中间省略）")
+_LONG29 = "".join("log line %05d %s\n" % (i, "y" * 60) for i in range(150))
+_MSGS29 = [
+    {"role": "user", "content": "run"},
+    {"role": "tool", "name": "terminal", "content": _LONG29},   # 历史 -> 削
+    {"role": "user", "content": "again"},
+    {"role": "tool", "name": "terminal", "content": _LONG29},   # 当前轮 -> 不削
+    {"role": "tool", "name": "cat", "content": "ok: 3 passed"},
+]
+_flat29 = P.flatten_messages(_MSGS29)[1]
+_hist29, _cur29, _short29 = (_flat29[1]["content"], _flat29[3]["content"],
+                             _flat29[4]["content"])
+_PREF29 = P.TOOL_RESULT_MARKER + " (terminal)]\n"
+_body29 = _hist29.split("\n", 1)[1]     # 剥掉 "[工具结果 (terminal)]" 前缀行
+check("削减：历史工具结果被截断（首尾保留 + 省略标记）",
+      len(_hist29) < len(_LONG29) and "已省略" in _hist29
+      and _body29.startswith(_LONG29[:20]) and _body29.endswith(_LONG29[-40:]),
+      (len(_LONG29), len(_hist29)))
+check("削减：信封前缀逐字节不变（历史与当前轮都是）",
+      _hist29.startswith(_PREF29) and _cur29.startswith(_PREF29)
+      and _short29.startswith(P.TOOL_RESULT_MARKER + " (cat)]\n"))
+check("削减：当前轮的 tool 结果全文保留", _cur29 == _PREF29 + _LONG29)
+check("削减：短结果不动", _short29.endswith("ok: 3 passed"))
+check("削减：完整 JSON 不削且仍可解析",
+      isinstance(json.loads(P._shrink_tool_result(
+          json.dumps({"a": [1, 2, 3] * 20}), 2000)), dict))
+check("削减：无 user 的会话 -> 全部视为当前轮（不削）",
+      P.flatten_messages([{"role": "system", "content": "s"},
+                          {"role": "tool", "name": "t",
+                           "content": _LONG29}])[1][0]["content"]
+      == P.TOOL_RESULT_MARKER + " (t)]\n" + _LONG29)
+os.environ["QD_TOOL_RESULT_KEEP"] = "0"
+check("开关：QD_TOOL_RESULT_KEEP=0 完全回退旧行为（全文回灌）",
+      P.flatten_messages(_MSGS29)[1][1]["content"] == _PREF29 + _LONG29)
+os.environ["QD_TOOL_RESULT_KEEP"] = "off"
+check("开关：off -> 关闭", P._tool_result_keep_chars() == 0)
+os.environ["QD_TOOL_RESULT_KEEP"] = "abc"
+check("开关：非法值回落默认", P._tool_result_keep_chars() == 2000)
+del os.environ["QD_TOOL_RESULT_KEEP"]
+check("开关：默认值 = 2000（保守）",
+      P._tool_result_keep_chars() == P.TOOL_RESULT_KEEP_DEFAULT == 2000)
+
+print()
+print("[27.7] 结构化工具历史直传（task-32：provider 白名单 + 一键回退）")
+_SMSGS32 = [
+    {"role": "user", "content": "weather?"},
+    {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call_1", "type": "function",
+         "function": {"name": "get_weather", "arguments": {"city": "SZ"}}}]},
+    {"role": "tool", "tool_call_id": "call_1", "name": "get_weather",
+     "content": "25C"},
+    {"role": "user", "content": "thanks"},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "call_2", "type": "function",
+         "function": {"name": "get_weather",
+                      "arguments": "{\"city\": \"BJ\"}"}}]},
+    {"role": "tool", "tool_call_id": "call_2", "name": "get_weather",
+     "content": "18C"},
+]
+_flat32s = P.flatten_messages(_SMSGS32, structured=True)[1]
+_flat32t = P.flatten_messages(_SMSGS32, structured=False)[1]
+os.environ.pop("QD_STRUCTURED_TOOL_HISTORY", None)
+check("开关：auto + CN + Qwen -> 结构化",
+      P.structured_tool_history_enabled(model="qwen3.8-flash",
+                                        model_key="qwen3.8-flash",
+                                        realm="cn", messages=_SMSGS32) is True)
+check("开关：auto + CN + GLM（上游 key gm5x）-> 结构化",
+      P.structured_tool_history_enabled(model="glm-5.3-flash",
+                                        model_key="gm53flash",
+                                        realm="cn", messages=_SMSGS32) is True)
+check("开关：auto + CN + DeepSeek -> 文本化（未验证 provider 默认不启用）",
+      P.structured_tool_history_enabled(model="deepseek-flash",
+                                        model_key="deepseek-flash",
+                                        realm="cn", messages=_SMSGS32) is False)
+check("开关：auto + INTL -> 文本化（INTL legacy 未实测）",
+      P.structured_tool_history_enabled(model="qwen3.8-flash",
+                                        model_key="qwen3.8-flash",
+                                        realm="intl", messages=_SMSGS32)
+      is False)
+os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "on"
+check("开关：on 强制（DeepSeek / INTL 也走结构化，供补验证）",
+      P.structured_tool_history_enabled(model="deepseek-flash",
+                                        model_key="deepseek-flash",
+                                        realm="intl", messages=_SMSGS32) is True)
+check("守卫：缺 tool_call_id -> 一律回退文本化（fail-safe）",
+      P.structured_tool_history_enabled(
+          model="qwen", model_key="qwen", realm="cn",
+          messages=[{"role": "user", "content": "x"},
+                    {"role": "tool", "content": "y"}]) is False)
+os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "off"
+check("开关：off 一键回退（即使 Qwen）",
+      P.structured_tool_history_enabled(model="qwen3.8-flash",
+                                        model_key="qwen3.8-flash",
+                                        realm="cn", messages=_SMSGS32) is False)
+del os.environ["QD_STRUCTURED_TOOL_HISTORY"]
+check("产物：tool 消息保留 role/tool_call_id，content 是非 null 字符串",
+      _flat32s[2] == {"role": "tool", "tool_call_id": "call_1",
+                      "content": "25C"} and _flat32s[5]["role"] == "tool")
+check("产物：assistant.content 为 \"\"（绝不为 null）+ tool_calls 结构齐备",
+      _flat32s[1]["content"] == "" and _flat32s[1]["content"] is not None
+      and _flat32s[1]["tool_calls"][0]["id"] == "call_1"
+      and _flat32s[1]["tool_calls"][0]["type"] == "function"
+      and _flat32s[1]["tool_calls"][0]["function"]["name"] == "get_weather")
+check("产物：arguments 的 dict 形态被归一为 JSON 字符串",
+      _flat32s[1]["tool_calls"][0]["function"]["arguments"] == '{"city": "SZ"}')
+check("产物：结构化模式下不存在 null content",
+      all(m.get("content") is not None for m in _flat32s))
+check("产物：当前轮（末尾 tool）同样走结构化，不与文本混用",
+      _flat32s[5] == {"role": "tool", "tool_call_id": "call_2",
+                      "content": "18C"})
+check("对照：文本化模式仍是 user 降级 + LEAK_MARKER，且无 tool 角色",
+      [m["role"] for m in _flat32t] == ["user", "assistant", "user", "user",
+                                        "assistant", "user"]
+      and _flat32t[1]["content"].endswith("]")
+      and P.TOOL_RESULT_MARKER in _flat32t[2]["content"])
+
+print()
+print("[27.8] 内层错误可观测性（HTTP 200 信封里藏 error）")
+_ERR34 = json.dumps({
+    "error": {"type": "invalid_request_error", "code": "invalid_request_error",
+              "message": "Messages with role 'tool' must be a response to a "
+                         "preceding message with 'tool_calls'"}})
+_ENV34 = ("data: " + json.dumps({"statusCodeValue": 200, "body": _ERR34},
+                                ensure_ascii=False) + "\n\n").encode("utf-8")
+_s0_34 = P.inner_error_snapshot()
+_lines34 = list(P.iter_inner_sse([_ENV34]))
+_s1_34 = P.inner_error_snapshot()
+check("内层 error：被识别并计数；chunk 仍照常透传（行为不变）",
+      _s1_34["total"] == _s0_34["total"] + 1
+      and _s1_34["kinds"].get("invalid_request", 0) >= 1
+      and len(_lines34) == 1)
+check("内层 error：同类重复计数累加、只按类别告警一次",
+      P.note_inner_upstream_error({"error": {"type": "provider_error",
+                                              "message": "provider_error"}},
+                                  status=200) == "invalid_request"
+      and P.note_inner_upstream_error(
+          {"error": {"message": "invalid_request again"}}, status=200)
+      == "invalid_request"
+      and P.inner_error_snapshot()["total"] == _s1_34["total"] + 2
+      and P.inner_error_snapshot()["warned"].count("invalid_request") == 1)
+check("内层 error：正常 chunk 不误判",
+      P.note_inner_upstream_error({"choices": [{"delta": {"content": "hi"}}]})
+      == "" and P.note_inner_upstream_error(None) == ""
+      and P.note_inner_upstream_error({"usage": {"total_tokens": 3}}) == "")
+check("内层 error：分类覆盖 content_policy / rate_limit",
+      P._inner_error_kind("DataInspectionFailed", "inappropriate content")
+      == "content_policy"
+      and P._inner_error_kind("", "usage exceeds frequency limit 10605")
+      == "rate_limit")
+check("内层 error：计数挂到运行信息（/usage/perf 返回含 inner_errors）",
+      "inner_errors" in P._perf_stats_uncached(sample=1)
+      and isinstance(P.inner_error_snapshot(), dict))
+
+
+def _raise34():
+    try:
+        list(P.iter_inner_sse([("data: " + json.dumps(
+            {"statusCodeValue": 418, "body": "boom"}) + "\n\n").encode("utf-8")]))
+        return "no-raise"
+    except P.UpstreamStatus as exc:
+        return "raised:%s" % exc.status
+
+
+check("形态区分：信封非 200 仍抛 UpstreamStatus（既有路径未变）",
+      _raise34() == "raised:418")
+
+print()
+print("[27.9] issue #16：散文+marker 同帧 / 未完成 \\uXXXX 转义（回读守卫边界）")
+_M16 = P.LEAK_MARKER
+_N16 = {"terminal"}
+_A16 = _M16 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"ls'
+_B116 = "我先看看目录结构。\n\n" + _A16
+_B316 = _M16 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"echo \\u63a'
+_C16 = "[工具结果]\n{\"output\": \"ok\"}\n[工具结果结束]"
+
+
+def _txt16(out):
+    return "".join(f["choices"][0]["delta"].get("content") or "" for f in out)
+
+
+_r16a = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_A16[:10]), _raw27(_A16[10:]), _raw27("", "stop")]), _N16)]
+check("A 参照（marker 开头 + 截断）-> 仍吞（回归）",
+      P.LEAK_MARKER not in _txt16(_r16a))
+_r16b1 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_B116), _raw27("", "stop")]), _N16)]
+check("B1 散文 + marker 同帧 -> 吞回声块、散文保留",
+      P.LEAK_MARKER not in _txt16(_r16b1)
+      and "我先看看目录结构。" in _txt16(_r16b1))
+_r16b2 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27("我先看看目录结构。\n\n"), _raw27(_A16), _raw27("", "stop")]),
+    _N16)]
+check("B2 散文与 marker 分帧 -> 同样吞（回归）",
+      P.LEAK_MARKER not in _txt16(_r16b2)
+      and "我先看看目录结构。" in _txt16(_r16b2))
+_r16b3 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_B316[:12]), _raw27(_B316[12:]), _raw27("", "stop")]), _N16)]
+check("B3 截断落在未写完的 \\uXXXX 转义 -> 吞",
+      P.LEAK_MARKER not in _txt16(_r16b3))
+_r16c = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_C16), _raw27("", "stop")]), _N16)]
+check("C [工具结果] 回声（回归）-> 吞", "[工具结果" not in _txt16(_r16c))
+check("B3 判据单元：未完成 / 彻底非法转义都视为可继续扩展",
+      P._json_array_prefix_ok('[{"a": "x\\u63a') is True
+      and P._json_array_prefix_ok('[{"a": "x\\uZZZZ') is True
+      and P._json_array_prefix_ok('[{"a": "x\\u63a2') is True)
+_r16e1 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27("列表项 [1, 2"), _raw27(", 3] 结束"), _raw27("", "stop")]),
+    _N16)]
+check("误伤边界：普通文本（含 [1, 2）原样透传",
+      _txt16(_r16e1) == "列表项 [1, 2, 3] 结束")
+_r16e2 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27("看这个 [assis"), _raw27("tant 是普通词"),
+          _raw27("", "stop")]), _N16)]
+check("误伤边界：帧尾 marker 真前缀（[assis）证伪后完整补发",
+      _txt16(_r16e2) == "看这个 [assistant 是普通词")
+_r16e4 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27("散文 " + _M16 + "\n"
+                + '[{"name": "terminal", "arguments": "{}"}]'),
+          _raw27("", "stop")]), _N16)]
+check("散文 + 完整合法数组 -> 仍走恢复路径（tool_calls），散文保留",
+      bool([f for f in _r16e4 if f["choices"][0]["delta"].get("tool_calls")])
+      and _txt16(_r16e4).startswith("散文"))
+check("窗口常量：_MARKER_HOLD_WINDOW = 最长标记 - 1（17）",
+      P._MARKER_HOLD_WINDOW == len(P.LEAK_MARKER) - 1 == 17)
+_obj16 = P.aggregate_stream(
+    _Resp27([_env27(_B116[:12]), _env27(_B116[12:]), _env27("", "stop")]),
+    "m27", None, allowed_names=_N16)
+check("非流式：散文 + marker 回声块 -> 只吞块、散文保留",
+      _obj16["choices"][0]["message"].get("content") == "我先看看目录结构。\n\n")
+_ev16 = [f.decode() for f in P.stream_responses_events(
+    iter([_raw27(_B116[:12]), _raw27(_B116[12:]), _raw27("", "stop")]), "m27",
+    {"usage": None, "custom_names": set(), "allowed_names": _N16})]
+check("Responses 流式：散文 + marker 同帧 -> 不回显 marker、散文保留",
+      P.LEAK_MARKER not in "".join(_ev16)
+      and "我先看看目录结构。" in "".join(_ev16))
+
+print()
+print("[27.95] issue #16 兜底：hold 缓冲上限（超限 fail-open 放行）")
+_BIG16 = P.LEAK_MARKER + "\n[" + "1," * 20000          # 约 40KB 的候选前缀
+_big_out = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_BIG16), _raw27("2]", "stop")]), {"terminal"})]
+_big_text = "".join(f["choices"][0]["delta"].get("content") or ""
+                    for f in _big_out)
+check("超限：hold 超过 _HOLD_MAX_CHARS -> fail-open 放行且内容只出现一次",
+      len(_BIG16) > P._HOLD_MAX_CHARS and _big_text == _BIG16 + "2]")
+check("上限常量：32KB / 200 帧",
+      P._HOLD_MAX_CHARS == 32768 and P._HOLD_MAX_FRAMES == 200)
+_keep_frames16 = P._HOLD_MAX_FRAMES
+try:
+    P._HOLD_MAX_FRAMES = 2
+    _fr16 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+        iter([_raw27(P.LEAK_MARKER), _raw27("\n["), _raw27("1"), _raw27("2"),
+              _raw27("", "stop")]), {"terminal"})]
+finally:
+    P._HOLD_MAX_FRAMES = _keep_frames16
+check("帧数兜底：超过 _HOLD_MAX_FRAMES 帧仍未证伪 -> 放行",
+      "".join(f["choices"][0]["delta"].get("content") or "" for f in _fr16)
+      == P.LEAK_MARKER + "\n[12")
+
+print()
 print("[28] 发布前补强：终局验证 §10.7#5 的零覆盖项（防止静默回归）")
 import ast as _ast28
 import re as _re28
@@ -3258,6 +3519,522 @@ check("default_dest_dir()：$QD_UMID_DIR 优先；默认 <repo>/umid（与 gatew
           os.path.dirname(os.path.abspath(U30.__file__)), "umid")
       and _dd_default30 != _dd_env30,
       (_dd_env30, _dd_default30))
+# 真实产物校验（仓库里存在才断言，否则显式 SKIP——绝不静默）：
+# umid/ 已被 .gitignore 忽略，CI/他人机器上通常没有，所以这条按环境降级为 SKIP。
+_umid_real30 = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "umid", "runtime-info")
+if os.path.isfile(_umid_real30):
+    with open(_umid_real30, "rb") as _fh30b:
+        _umid_data30 = _fh30b.read()
+    check("真实产物：umid/runtime-info 被识别为 elf-x86_64 且落在体积启发式区间"
+          "（提取链路端到端产物，非合成样本）",
+          U30.identify_blob(_umid_data30) == "elf-x86_64"
+          and U30.verify_component(_umid_data30, "elf-x86_64")
+          and U30.HEURISTIC_SIZE_MIN <= len(_umid_data30) <= U30.HEURISTIC_SIZE_MAX,
+          (len(_umid_data30), U30.identify_blob(_umid_data30)))
+print()
+print("[31] issue #11 工具结果回声 + 标记常量契约 + issue #12 原生桥失败可见性")
+
+# --- 31.1 #11 判据：吞掉 / 不吞（直接调用判据函数，离线） ---
+_TR31 = P.TOOL_RESULT_MARKER          # "[工具结果"（值不含 ]，写入侧拼 name）
+_TC31 = P.TOOL_RESULT_CLOSE           # "[工具结果结束]"（模型自造的闭标记）
+_NAMES31 = {"terminal"}
+_PROD31 = (_TR31 + "]\n" + '{"output":"ok"}' + "\n" + _TC31 + "\n"
+           "<system_warning>x</system_warning>")
+check("#11 判据·吞：生产样本（开标记 + JSON + 自造闭标记 + 夹带 system_warning）",
+      P._tool_echo_droppable(_PROD31, _NAMES31) is True)
+check("#11 判据·吞：截断（无闭标记，body 以 { 开头）",
+      P._tool_echo_droppable(_TR31 + "]\n" + '{"output": "partial', _NAMES31) is True)
+check("#11 判据·吞：只有开标记（退化形态，与 #9 的纯 marker 一致）",
+      P._tool_echo_droppable(_TR31 + "]", _NAMES31) is True)
+check("#11 判据·吞：带 name 的开标记行（写入侧真实形态）",
+      P._tool_echo_droppable(_TR31 + " (terminal)]\n" + '{"a":1}', _NAMES31) is True)
+check("#11 判据·不吞：标记后跟自然语言散文（fail-open）",
+      P._tool_echo_droppable(_TR31 + "] 这段是普通说明", _NAMES31) is False)
+check("#11 判据·不吞：不以标记开头（讨论该标记的普通回复）",
+      P._tool_echo_droppable("网关会写入 " + _TR31 + "] 这样的提示", _NAMES31) is False)
+check("#11 判据·不吞：未声明 tools（allowed_names 为 None / 空集）",
+      P._tool_echo_droppable(_PROD31, None) is False
+      and P._tool_echo_droppable(_PROD31, set()) is False)
+check("#11 判据·不吞：标记行未闭合 / 跨行闭合（不是网关形态）",
+      P._tool_echo_droppable(_TR31 + " 没有右括号", _NAMES31) is False
+      and P._tool_echo_droppable(_TR31 + "\n换行后才]闭合", _NAMES31) is False)
+check("#11 hold-back：标记未打完要压住，证伪（散文）立即放行；统一暂存包含两种回声",
+      P._tool_echo_prefix_hold("[工") is True
+      and P._tool_echo_prefix_hold(_TR31 + "] 散文说明") is False
+      and P._echo_hold_candidate(P.LEAK_MARKER + "\n[") is True
+      and P._echo_hold_candidate(_TR31 + "]") is True)
+
+# --- 31.2 #11 三条链路端到端（复用 [27] 段的帧辅助） ---
+_fr31_drop = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_PROD31[:10]), _raw27(_PROD31[10:]), _raw27("", "stop")]),
+    _NAMES31)]
+_text31_drop = "".join(_f["choices"][0]["delta"].get("content") or ""
+                       for _f in _fr31_drop)
+check("#11 流式：开闭对回声被吞（正文空、无标记泄漏、finish_reason 仍 stop）",
+      _text31_drop == ""
+      and _TR31 not in json.dumps(_fr31_drop, ensure_ascii=False)
+      and _fr31_drop[-1]["choices"][0]["finish_reason"] == "stop",
+      _text31_drop)
+_trunc31 = _TR31 + "]\n" + '{"output": "partial'
+_fr31_tr = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_trunc31[:8]), _raw27(_trunc31[8:]), _raw27("", "stop")]),
+    _NAMES31)]
+_text31_tr = "".join(_f["choices"][0]["delta"].get("content") or ""
+                     for _f in _fr31_tr)
+check("#11 流式：截断回声被吞（正文空）", _text31_tr == "", _text31_tr)
+_fr31_keep = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_TR31 + "] 这是一段解释文字。"), _raw27("", "stop")]), _NAMES31)]
+_text31_keep = "".join(_f["choices"][0]["delta"].get("content") or ""
+                       for _f in _fr31_keep)
+check("#11 流式：散文形态原样透传（fail-open 不吞字）",
+      _TR31 in _text31_keep and "解释文字" in _text31_keep, _text31_keep)
+_obj31 = P.aggregate_stream(
+    _Resp27([_env27(_PROD31[:12]), _env27(_PROD31[12:]), _env27("", "stop")]),
+    "m31", None, allowed_names=_NAMES31)
+_msg31 = _obj31["choices"][0]["message"]
+check("#11 非流式：content 清空、无 tool_calls、finish=stop（与 #9 同语义）",
+      _msg31.get("content") == "" and not _msg31.get("tool_calls")
+      and _obj31["choices"][0]["finish_reason"] == "stop", _msg31)
+_ev31 = "".join(f.decode() for f in P.stream_responses_events(
+    iter([_raw27(_PROD31[:12]), _raw27(_PROD31[12:]), _raw27("", "stop")]),
+    "m31", {"usage": None, "custom_names": set(), "allowed_names": _NAMES31}))
+check("#11 Responses 流式：事件里既无开标记也无闭标记",
+      _TR31 not in _ev31 and _TC31 not in _ev31)
+
+# --- 31.3 标记常量契约：写入侧引用常量 + 写出字节逐字节不变 ---
+_src31 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qoder_proxy.py"), encoding="utf-8").read()
+check("#11 写入侧引用常量（源码里不得再有 [工具结果%s] 裸模板）",
+      'TOOL_RESULT_MARKER + name + "]\\n"' in _src31
+      and '"[工具结果%s]"' not in _src31,
+      [_l.strip() for _l in _src31.splitlines() if "[工具结果" in _l][:3])
+_sys31, _flat31, _img31 = P.flatten_messages([
+    {"role": "tool", "name": "t", "content": "X"},
+    {"role": "tool", "content": "Y"}])
+_flat_set31 = {m["content"] for m in _flat31}
+check("#11 写入格式逐字节不变（常量拼接结果 == 旧字面量模板）",
+      "[工具结果 (t)]\nX" in _flat_set31 and "[工具结果]\nY" in _flat_set31
+      and (_TR31 + " (t)]\nX") in _flat_set31,
+      sorted(_flat_set31))
+
+# --- 31.4 issue #12：原生桥失败的可见性（打桩 scenario，全程离线） ---
+import contextlib as _cl31
+import io as _io31
+import shutil as _sh31
+import tempfile as _tf31
+_tmp31 = _tf31.mkdtemp(prefix="qd-exec31-")
+try:
+    _exe31 = os.path.join(_tmp31, "runtime-info")
+    with open(_exe31, "w", encoding="utf-8") as _fh31:
+        _fh31.write("#!/bin/sh\necho hi\n")        # 存在但不是可执行的原生组件
+    _orig_rie31 = A.runtime_info_exe
+    _orig_warned31 = set(A._runtime_info_warned)
+    try:
+        A._runtime_info_warned.clear()
+        A.runtime_info_exe = lambda realm: ""
+        _err31_missing = _io31.StringIO()
+        with _cl31.redirect_stderr(_err31_missing):
+            _res31_missing = A.run_runtime_info("cn", "u31")
+        check("#12 组件不存在：静默降级（返回 {} 且 stderr 无任何提示）",
+              _res31_missing == {} and _err31_missing.getvalue() == "",
+              _err31_missing.getvalue()[:120])
+
+        A._runtime_info_warned.clear()
+        A.runtime_info_exe = lambda realm: _exe31
+        _err31_exec = _io31.StringIO()
+        with _cl31.redirect_stderr(_err31_exec):
+            _res31_exec = A.run_runtime_info("cn", "u31")
+        _msg31_exec = _err31_exec.getvalue()
+        check("#12 组件在但执行失败：返回 {} 且 stderr 有可诊断提示"
+              "（[runtime-info] 前缀 + 组件路径 + 修法提示）",
+              _res31_exec == {} and "[runtime-info]" in _msg31_exec
+              and _exe31 in _msg31_exec and "无法执行" in _msg31_exec,
+              _msg31_exec[:200])
+        check("#12 两种情况可区分：'不存在' 完全静默 vs '跑不起来' 有提示",
+              _err31_missing.getvalue() == "" and _msg31_exec != "")
+        _err31_again = _io31.StringIO()
+        with _cl31.redirect_stderr(_err31_again):
+            A.run_runtime_info("cn", "u31")
+        check("#12 同一类失败同进程只提示一次（批量签到不刷屏）",
+              _err31_again.getvalue() == "", _err31_again.getvalue()[:120])
+    finally:
+        A.runtime_info_exe = _orig_rie31
+        A._runtime_info_warned.clear()
+        A._runtime_info_warned.update(_orig_warned31)
+finally:
+    _sh31.rmtree(_tmp31, ignore_errors=True)
+
+print()
+print("[32] task-32 结构化直传：产物字段形态 / 双路径对照 / 开关三态 / fail-safe")
+
+_MSGS32 = [
+    {"role": "user", "content": "查天气"},
+    {"role": "assistant", "content": None,
+     "tool_calls": [{"id": "call_1", "type": "function",
+                     "function": {"name": "get_weather",
+                                  "arguments": {"city": "SZ"}}}]},
+    {"role": "tool", "tool_call_id": "call_1", "name": "get_weather",
+     "content": "25C"},
+    {"role": "user", "content": "结果呢？"},
+]
+_sys32, _flat_s32, _img32 = P.flatten_messages(_MSGS32, structured=True)
+_tool32 = [m for m in _flat_s32 if m.get("role") == "tool"]
+_asst32 = [m for m in _flat_s32
+           if m.get("role") == "assistant" and m.get("tool_calls")]
+check("结构化产物：tool 消息保留 role + tool_call_id，content 为字符串且保留正文",
+      len(_tool32) == 1 and _tool32[0].get("tool_call_id") == "call_1"
+      and isinstance(_tool32[0].get("content"), str)
+      and "25C" in _tool32[0]["content"],
+      _tool32)
+check("结构化产物：assistant.tool_calls 保留 id/type/function，arguments 归一为 JSON 字符串",
+      len(_asst32) == 1
+      and _asst32[0]["tool_calls"][0].get("id") == "call_1"
+      and _asst32[0]["tool_calls"][0].get("type") == "function"
+      and _asst32[0]["tool_calls"][0].get("function", {}).get("name") == "get_weather"
+      and isinstance(_asst32[0]["tool_calls"][0]["function"].get("arguments"), str)
+      and json.loads(_asst32[0]["tool_calls"][0]["function"]["arguments"])["city"] == "SZ",
+      _asst32)
+check("结构化产物：**不存在 None content**（task-31 实测 null 会被 DeepSeek/Kimi 拒绝）",
+      all(m.get("content") is not None for m in _flat_s32)
+      and all(m.get("content") == "" or isinstance(m.get("content"), str)
+              for m in _flat_s32),
+      [(m.get("role"), m.get("content")) for m in _flat_s32])
+_sys32b, _flat_t32, _img32b = P.flatten_messages(_MSGS32, structured=False)
+check("双路径对照：文本化把 tool 降级为 user+TOOL_RESULT_MARKER，结构化保留 role=tool",
+      any(m.get("role") == "user"
+          and str(m.get("content") or "").startswith(P.TOOL_RESULT_MARKER)
+          for m in _flat_t32)
+      and not any(m.get("role") == "tool" for m in _flat_t32)
+      and any(m.get("role") == "tool" for m in _flat_s32),
+      [m.get("role") for m in _flat_t32])
+check("双路径对照：文本化把 assistant.tool_calls 序列化进 content（LEAK_MARKER），结构化不写正文",
+      any(P.LEAK_MARKER in str(m.get("content") or "")
+          for m in _flat_t32 if m.get("role") == "assistant")
+      and not any("tool_calls" in m for m in _flat_t32)
+      and all("tool_calls" in m for m in _asst32),
+      [str(m.get("content"))[:60] for m in _flat_t32 if m.get("role") == "assistant"])
+
+_orig_env32 = os.environ.pop("QD_STRUCTURED_TOOL_HISTORY", None)
+try:
+    _auto_cn_qwen = P.structured_tool_history_enabled(
+        "Qwen3.8-Flash", "qfmodel", "cn", _MSGS32)
+    _auto_cn_glm = P.structured_tool_history_enabled(
+        "GLM-5.3-Flash", "gm53flash", "cn", _MSGS32)
+    _auto_cn_glm2 = P.structured_tool_history_enabled(
+        "glm-4.6", "glm4x", "cn", _MSGS32)
+    _auto_cn_ds = P.structured_tool_history_enabled(
+        "DeepSeek-Flash", "dfmodel", "cn", _MSGS32)
+    _auto_cn_kimi = P.structured_tool_history_enabled(
+        "Kimi-K2.8-Preview", "kmodel", "cn", _MSGS32)
+    _auto_intl_qwen = P.structured_tool_history_enabled(
+        "Qwen3.8-Flash", "qfmodel", "intl", _MSGS32)
+    _unk_mode = None
+    os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "banana"
+    _unk_mode = P._structured_mode()
+    os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "on"
+    _on_cn_ds = P.structured_tool_history_enabled(
+        "DeepSeek-Flash", "dfmodel", "cn", _MSGS32)
+    _on_intl_ds = P.structured_tool_history_enabled(
+        "DeepSeek-Flash", "dfmodel", "intl", _MSGS32)
+    os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "off"
+    _off_cn_qwen = P.structured_tool_history_enabled(
+        "Qwen3.8-Flash", "qfmodel", "cn", _MSGS32)
+finally:
+    if _orig_env32 is None:
+        os.environ.pop("QD_STRUCTURED_TOOL_HISTORY", None)
+    else:
+        os.environ["QD_STRUCTURED_TOOL_HISTORY"] = _orig_env32
+
+check("开关三态·auto：默认只放行 CN+白名单（Qwen/GLM/gm4 真；DeepSeek/Kimi/INTL 假）",
+      _auto_cn_qwen is True and _auto_cn_glm is True and _auto_cn_glm2 is True
+      and _auto_cn_ds is False and _auto_cn_kimi is False
+      and _auto_intl_qwen is False,
+      (_auto_cn_qwen, _auto_cn_glm, _auto_cn_ds, _auto_cn_kimi, _auto_intl_qwen))
+check("开关三态·on/off：on 强制放行（含 DeepSeek/INTL），off 一律关闭",
+      _on_cn_ds is True and _on_intl_ds is True and _off_cn_qwen is False,
+      (_on_cn_ds, _on_intl_ds, _off_cn_qwen))
+check("开关三态·未知值回落 auto（不误开）；恢复后默认仍是 auto",
+      _unk_mode == "auto" and P._structured_mode() == "auto",
+      (_unk_mode, P._structured_mode()))
+
+_bad_ids32 = [
+    {"role": "user", "content": "x"},
+    {"role": "assistant", "content": "",
+     "tool_calls": [{"id": "", "function": {"name": "f"}}]},
+    {"role": "tool", "tool_call_id": "", "content": "y"},
+]
+check("fail-safe：id 不齐备（tool_call_id / tool_calls.id 空）→ 恒回退文本化",
+      P._tool_ids_ok(_bad_ids32) is False
+      and P.structured_tool_history_enabled(
+          "Qwen3.8-Flash", "qfmodel", "cn", _bad_ids32) is False)
+try:
+    os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "on"
+    _on_bad_ids = P.structured_tool_history_enabled(
+        "Qwen3.8-Flash", "qfmodel", "cn", _bad_ids32)
+finally:
+    if _orig_env32 is None:
+        os.environ.pop("QD_STRUCTURED_TOOL_HISTORY", None)
+    else:
+        os.environ["QD_STRUCTURED_TOOL_HISTORY"] = _orig_env32
+check("fail-safe：即使显式 on，id 不齐备也不放行（宁可少用不发畸形请求）",
+      _on_bad_ids is False, _on_bad_ids)
+
+_r32 = [{"role": "assistant", "content": "x", "reasoning_content": "think",
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "f", "arguments": "{}"}}]}]
+_, _flat_r_on32, _ = P.flatten_messages(_r32, keep_reasoning=True, structured=True)
+_, _flat_r_off32, _ = P.flatten_messages(_r32, keep_reasoning=False, structured=True)
+check("结构化产物：reasoning_content 仍按 keep_reasoning 规则保留（与文本化路径一致）",
+      _flat_r_on32[0].get("reasoning_content") == "think"
+      and "reasoning_content" not in _flat_r_off32[0],
+      (_flat_r_on32[0].get("reasoning_content"), _flat_r_off32[0].keys()))
+_args_none32 = P.flatten_messages(
+    [{"role": "assistant", "content": "",
+      "tool_calls": [{"id": "c1", "function": {"name": "f",
+                                               "arguments": None}}]}],
+    structured=True)[1][0]["tool_calls"][0]["function"]["arguments"]
+_args_scalar32 = P.flatten_messages(
+    [{"role": "assistant", "content": "",
+      "tool_calls": [{"id": "c1", "function": {"name": "f",
+                                               "arguments": 42}}]}],
+    structured=True)[1][0]["tool_calls"][0]["function"]["arguments"]
+print()
+print("[33] issue #16 误伤边界：帧尾 marker 前缀 hold 不得吞掉正常文本、不得延迟恢复")
+
+
+def _f33(content, fin=None):
+    delta = {}
+    if content is not None:
+        delta["content"] = content
+    inner = {"id": "c33", "model": "m33", "created": 1,
+             "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
+    return ("data: " + json.dumps(inner, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
+def _join33(chunks, names=None):
+    return "".join(json.loads(f[6:])["choices"][0]["delta"].get("content") or ""
+                   for f in P.recover_leaked_tool_calls(iter(chunks), names))
+
+
+_M33 = P.LEAK_MARKER
+_NAMES33 = {"terminal"}
+
+_t33a = "数组是这样的：\n["
+check("误伤①：正文以 '[' 结尾（未闭合 JSON 引用）→ 原样透传，不被吞",
+      _join33([_f33(_t33a), _f33("", "stop")], _NAMES33) == _t33a,
+      _join33([_f33(_t33a), _f33("", "stop")], _NAMES33))
+_t33b = "看这个 [ass"
+check("误伤②：正文以 '[ass'（marker 前缀但未完整）结尾 → 跨帧后原样透传",
+      _join33([_f33(_t33b), _f33(" 只是标记的开头", "stop")], _NAMES33)
+      == _t33b + " 只是标记的开头",
+      _join33([_f33(_t33b), _f33(" 只是标记的开头", "stop")], _NAMES33))
+_t33c = "网关会写入 " + _M33 + " 这样的提示，不是真的调用。"
+check("误伤③：含 marker 但后面是自然语言 → 原样透传（讨论而非调用）",
+      _join33([_f33(_t33c), _f33("", "stop")], _NAMES33) == _t33c)
+_calls33 = json.dumps([{"name": "terminal",
+                        "arguments": json.dumps({"cmd": "ls"}, ensure_ascii=False)}],
+                      ensure_ascii=False)
+_t33d = _M33 + "\n" + _calls33
+_fr33d = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_f33(_t33d), _f33("", "stop")]), _NAMES33)]
+check("误伤④：marker + 完整合法数组 → 走恢复路径（tool_calls 增量），既不吞也不泄漏",
+      any(f["choices"][0]["delta"].get("tool_calls") for f in _fr33d)
+      and _M33 not in json.dumps(_fr33d, ensure_ascii=False)
+      and not any(f["choices"][0]["delta"].get("content") for f in _fr33d),
+      _fr33d)
+_t33e = "格式是 [a-z]+ 这种正则，或者 [1,2,3] 这种数组。"
+check("误伤⑤：正文含 '[' 但不以 marker 开头 → 原样透传",
+      _join33([_f33(_t33e), _f33("", "stop")], _NAMES33) == _t33e)
+_t33f = "第一段 [ass"
+_t33f2 = "istant 请求调用工具] 不是 marker 全文"
+_fr33f = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_f33(_t33f), _f33(_t33f2, "stop")]), _NAMES33)]
+_text33f = "".join(f["choices"][0]["delta"].get("content") or "" for f in _fr33f)
+check("误伤⑥：跨帧拼接内容守恒（正常文本不丢字、不被误吞；含 marker 字样也照传）",
+      _text33f == _t33f + _t33f2, _text33f)
+
+# --- issue #16 五形态：用汤圆给作者的**原样样本**（A/B1/B2/B3/C） ---
+_M16 = P.LEAK_MARKER
+_A16 = _M16 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"ls'
+_B116 = "我先看看目录结构。" + "\n\n" + _A16
+_B216 = ["我先看看目录结构。\n\n", _A16]
+_B316 = _M16 + "\n" + \
+    '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"echo \\u63a'
+_C16 = "[工具结果]" + "\n" + '{"output": "ok"}' + "\n" + "[工具结果结束]"
+
+
+def _frames16(chunks):
+    return [json.loads(f[6:]) for f in
+            P.recover_leaked_tool_calls(iter(chunks), _NAMES33)]
+
+
+def _text16(frames):
+    return "".join(f["choices"][0]["delta"].get("content") or "" for f in frames)
+
+
+def _fin16(frames):
+    return frames[-1]["choices"][0].get("finish_reason")
+
+
+_frA16 = _frames16([_f33(_A16[:20]), _f33(_A16[20:]), _f33("", "stop")])
+check("#16·A（原样样本：marker+截断 JSON 切两刀）→ 内容不含标记、收尾帧 finish_reason=stop",
+      _M16 not in _text16(_frA16) and _fin16(_frA16) == "stop", _text16(_frA16))
+_frB116 = _frames16([_f33(_B116), _f33("", "stop")])
+check("#16·B1（原样样本：散文+marker 同帧）→ 散文保留、标记不泄漏、finish=stop",
+      "我先看看目录结构。" in _text16(_frB116)
+      and _M16 not in _text16(_frB116) and _fin16(_frB116) == "stop",
+      _text16(_frB116))
+_frB216 = _frames16([_f33(x) for x in _B216] + [_f33("", "stop")])
+check("#16·B2（原样样本：散文与 marker 分帧）→ 散文保留、标记不泄漏、finish=stop",
+      "我先看看目录结构。" in _text16(_frB216)
+      and _M16 not in _text16(_frB216) and _fin16(_frB216) == "stop",
+      _text16(_frB216))
+_frB316 = _frames16([_f33(_B316[:20]), _f33(_B316[20:]), _f33("", "stop")])
+check("#16·B3（原样样本：\\u63a 未写完转义）→ 内容不含标记、finish=stop",
+      _M16 not in _text16(_frB316) and _fin16(_frB316) == "stop",
+      _text16(_frB316))
+_frC16 = _frames16([_f33(_C16[:8]), _f33(_C16[8:]), _f33("", "stop")])
+check("#16·C（原样样本：工具结果回声）→ 不含 \"[工具结果\"、finish=stop（#11 回归保护）",
+      "[工具结果" not in _text16(_frC16) and _fin16(_frC16) == "stop",
+      _text16(_frC16))
+
+# --- hold 上限：长文本以 [ 开头且久不闭合必须放行（不得无限缓冲） ---
+_HOLD_LIMIT16 = getattr(P, "_MARKER_HOLD_WINDOW", None)
+check("#16·hold 窗口常量存在且为标记长度量级（不是无上限）",
+      isinstance(_HOLD_LIMIT16, int) and 1 <= _HOLD_LIMIT16 <= 64, _HOLD_LIMIT16)
+_long16 = "[" + ("x" * 2000)
+_frLong16 = _frames16([_f33(_long16[:500]), _f33(_long16[500:]), _f33("", "stop")])
+check("#16·hold 上限：长文本以 '[' 开头且久不闭合 → 内容全部放行、不丢字",
+      _text16(_frLong16) == _long16,
+      (len(_text16(_frLong16)), len(_long16)))
+_frFirst16 = _frames16([_f33(_long16[:500]), _f33("", "stop")])
+_emitFirst16 = _text16(_frFirst16)
+print()
+print("[34] task-37 细致复查：长链/反转/其它截断点/窗口与上限边界/结构化交互")
+
+
+def _run34(chunks, names=None):
+    """返回 (客户端文本, tool_calls 帧数, 末帧 finish_reason)。"""
+    _txt, _tcs, _fin = [], 0, None
+    for _f in P.recover_leaked_tool_calls(iter(chunks), names or _NAMES33):
+        try:
+            _o = json.loads(_f.decode("utf-8")[6:] if isinstance(_f, bytes) else _f[6:])
+        except Exception:
+            continue
+        _d = _o["choices"][0]["delta"]
+        if _d.get("content"):
+            _txt.append(_d["content"])
+        if _d.get("tool_calls"):
+            _tcs += 1
+        if _o["choices"][0].get("finish_reason"):
+            _fin = _o["choices"][0]["finish_reason"]
+    return "".join(_txt), _tcs, _fin
+
+
+_CALLS34 = json.dumps([{"name": "terminal",
+                        "arguments": json.dumps({"cmd": "ls"}, ensure_ascii=False)}],
+                      ensure_ascii=False)
+_LONG34 = _M33 + "\n" + _CALLS34
+_chunks34 = [_f33(_LONG34[i:i + 6]) for i in range(0, len(_LONG34), 6)]
+_t34a, _tc34a, _fin34a = _run34(_chunks34 + [_f33("", "stop")])
+check("#37·长链：marker+JSON 切成 %d 帧 → 恢复为 tool_calls、无泄漏、finish=tool_calls"
+      % len(_chunks34),
+      _tc34a > 0 and _t34a == "" and _fin34a == "tool_calls",
+      (_tc34a, _fin34a, _t34a[:60]))
+
+for _tag, _parts in (
+        ("1b 疑似 marker 后证伪（散文首帧）",
+         ["我先看看目录结构。\n\n", "[assis", "tant 请求调用工具] 这只是一段说明文字"]),
+        ("1c 前缀被打断", ["[assis", "这只是一个普通说明，不是标记。"]),
+        ("1d 完整 marker 但后接散文", ["[assistant 请求调用工具", "]\n这不是数组，是中文说明"])):
+    _want = "".join(_parts)
+    _got, _tc, _fn = _run34([_f33(x) for x in _parts] + [_f33("", "stop")])
+    # 注意：反转=已证伪为普通文本 → 原样补发，**marker 明文出现是正确行为**
+    # （模型确实在讨论该标记）；这里只要求内容守恒且不被误判为工具调用。
+    check("#37·反转（%s）→ 证伪后完整补发（内容逐字节守恒、不误判为 tool_calls）" % _tag,
+          _got == _want and _tc == 0,
+          (len(_got), len(_want), _got[:60]))
+
+for _tag, _payload in (
+        ("2a 代理对半截 \\ud83d",
+         _M33 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"echo \\ud83d'),
+        ("2b 双重转义 \\\\u63a2",
+         _M33 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"echo \\\\u63a2'),
+        ("2c \\u63a 与 2 分帧",
+         _M33 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"echo \\u63a')):
+    _cut = len(_payload) // 2
+    _t, _tc, _fn = _run34([_f33(_payload[:_cut]), _f33(_payload[_cut:]),
+                           _f33("", "stop")])
+    check("#37·截断点（%s）→ 整段被吞、无标记泄漏、finish=stop" % _tag,
+          _t == "" and _tc == 0 and _fn == "stop", _t[:60])
+
+_HOLDWIN34 = getattr(P, "_MARKER_HOLD_WINDOW", 17)
+for _cut in (_HOLDWIN34 - 1, _HOLDWIN34, _HOLDWIN34 + 1):
+    _pre, _rest = _M33[:_cut], _M33[_cut:] + "\n" + _CALLS34
+    _t, _tc, _fn = _run34([_f33(_pre), _f33(_rest), _f33("", "stop")])
+    check("#37·窗口边界：帧尾恰好 %d 字 marker 前缀 → 仍被识别（恢复 tool_calls、无泄漏）"
+          % _cut, _tc > 0 and _t == "" and _M33 not in _t, (_tc, _t[:40]))
+
+_HOLDMAX34 = getattr(P, "_HOLD_MAX_CHARS", 32768)
+_pad34 = "x" * (_HOLDMAX34 - len(_M33) - 200)
+_under34 = _M33 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"' + _pad34 + '\\"'
+_t, _tc, _fn = _run34([_f33(_under34[:8000]), _f33(_under34[8000:16000]),
+                       _f33(_under34[16000:]), _f33("", "stop")])
+check("#37·上限内（%d 字 < %d）未闭合块 → 仍被拦（吞掉、无泄漏）"
+      % (len(_under34), _HOLDMAX34),
+      _t == "" and _tc == 0, (len(_under34), _t[:40]))
+_blob34 = _M33 + "\n" + json.dumps(
+    [{"name": "terminal", "arguments": json.dumps({"cmd": _pad34}, ensure_ascii=False)}],
+    ensure_ascii=False)
+_c34 = len(_blob34) // 3
+_t, _tc, _fn = _run34([_f33(_blob34[:_c34]), _f33(_blob34[_c34:2 * _c34]),
+                       _f33(_blob34[2 * _c34:]), _f33("", "stop")])
+check("#37·上限内（%d 字）合法完整数组 → 恢复为 tool_calls（大数据块不被误放行）"
+      % len(_blob34),
+      _tc > 0 and _t == "" and _fn == "tool_calls", (_tc, _fn))
+_over34 = _under34 + "y" * (_HOLDMAX34 + 200 - len(_under34))
+_t, _tc, _fn = _run34([_f33(_over34[:_HOLDMAX34 // 2]), _f33(_over34[_HOLDMAX34 // 2:]),
+                       _f33("", "stop")])
+check("#37·超上限（%d 字 > %d）→ fail-open 放行，且**只输出一次**（长度守恒、无重复）"
+      % (len(_over34), _HOLDMAX34),
+      _t == _over34 and _tc == 0, (len(_t), len(_over34), _t == _over34))
+
+_msgs34 = [{"role": "user", "content": "查天气"},
+           {"role": "assistant", "content": "", "tool_calls": [
+               {"id": "c1", "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"city": "SZ"}'}}]},
+           {"role": "tool", "tool_call_id": "c1", "content": "25C"}]
+_s34, _flat_s34, _ = P.flatten_messages(_msgs34, structured=True)
+_t34x, _flat_t34, _ = P.flatten_messages(_msgs34, structured=False)
+check("#37·结构化交互：结构化产物**不含**回读标记，文本化产物**含**（两者不打架）",
+      _M33 not in json.dumps(_flat_s34, ensure_ascii=False)
+      and P.TOOL_RESULT_MARKER not in json.dumps(_flat_s34, ensure_ascii=False)
+      and _M33 in json.dumps(_flat_t34, ensure_ascii=False),
+      ([m.get("role") for m in _flat_s34], [m.get("role") for m in _flat_t34]))
+_env37 = os.environ.get("QD_STRUCTURED_TOOL_HISTORY")
+try:
+    os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "on"
+    _on37 = P.structured_tool_history_enabled("Qwen3.8-Flash", "qfmodel", "intl", _msgs34)
+finally:
+    if _env37 is None:
+        os.environ.pop("QD_STRUCTURED_TOOL_HISTORY", None)
+    else:
+        os.environ["QD_STRUCTURED_TOOL_HISTORY"] = _env37
+_t, _tc, _fn = _run34([_f33(_LONG34[:10]), _f33(_LONG34[10:]), _f33("", "stop")])
+check("#37·结构化交互：on 模式下回读守卫仍独立生效（同一输入仍恢复 tool_calls）",
+      _on37 is True and _tc > 0 and _M33 not in _t and _fn == "tool_calls",
+      (_on37, _tc, _fn))
+
+# --- Lead 侧补充（task-37 复查）：窗口是**功能性必需**，不是优化项 ---
+# 铁蛋的 V2 变异（把 _MARKER_HOLD_WINDOW 压到 1）没变红，是因为他的用例帧 1 是纯 marker 前缀；
+# 下面这条带散文前缀、且被切处落在窗口内 —— 实测窗口=1 时会真实泄漏，用来守住窗口参数被误改。
+_dd_pre = "我先看看：" + _M33[:9]
+_dd_rest = _M33[9:] + "\n" + _CALLS34
+_t, _tc, _fn = _run34([_f33(_dd_pre), _f33(_dd_rest), _f33("", "stop")])
+check("跨帧补全依赖窗口：散文 + 被切开的 marker → marker 不泄漏且散文保留",
+      _M33 not in _t and _M33[:9] not in _t and "我先看看" in _t,
+      (_tc, _t[:60]))
 
 print()
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"

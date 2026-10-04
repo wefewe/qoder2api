@@ -1870,13 +1870,18 @@ check("retry keeps the second (populated) payload",
       len(_st25.get("campaigns") or []) == 1
       and _st25["campaigns"][0]["campaign_key"] == "act-x")
 
-# --- 20.6 campaign_checkin 先强制刷新身份（轮换后不漏领） ---
+# --- 20.6 campaign_checkin 走【缓存优先】的身份链路 ---
+# 设计 §9.1（身份落盘缓存）明确废除"每次领取都 force 刷新"：那会每次把落盘缓存
+# 刷成新身份，直接违背"重建不换"的目标。新语义＝照常走身份链路但【不传 force】，
+# 由 native_machine_identity 的缓存优先逻辑决定是否真的调组件。
 _orig_get2 = A.Account._campaigns_get
 _orig_native2 = A.native_machine_identity
+_calls2 = []
 _forced2 = []
 
 
 def _stub_native2(realm, account_id, force=False):
+    _calls2.append((realm, account_id))
     if force:
         _forced2.append(account_id)
     return {"machineToken": "t", "machineType": "ty", "machineCode": "c",
@@ -1893,8 +1898,9 @@ try:
 finally:
     A.Account._campaigns_get = _orig_get2
     A.native_machine_identity = _orig_native2
-check("campaign_checkin force-refreshes the machine identity first",
-      _forced2 == ["cp26"], _forced2)
+check("campaign_checkin 不 force：走缓存优先链路（设计 §9.1 废除每次领取换身份）",
+      _forced2 == [] and len(_calls2) >= 1 and _calls2[0] == ("cn", "cp26"),
+      (_forced2, _calls2))
 
 # --- 20.4 思考档位归一化（官方词表因模型而异，未命中会被上游静默忽略） ---
 _meta_df = next(m for m in C.models_for_realm("cn") if m["key"] == "dfmodel")
@@ -4032,9 +4038,456 @@ check("#37·结构化交互：on 模式下回读守卫仍独立生效（同一�
 _dd_pre = "我先看看：" + _M33[:9]
 _dd_rest = _M33[9:] + "\n" + _CALLS34
 _t, _tc, _fn = _run34([_f33(_dd_pre), _f33(_dd_rest), _f33("", "stop")])
-check("跨帧补全依赖窗口：散文 + 被切开的 marker → marker 不泄漏且散文保留",
-      _M33 not in _t and _M33[:9] not in _t and "我先看看" in _t,
-      (_tc, _t[:60]))
+print()
+print("[35] 机器身份落盘缓存（task-48 · 设计 v1.2.13 第七节：12 条离线）")
+import shutil as _sh35
+import tempfile as _tf35
+import threading as _th35
+
+_IDC_KEYS = ("ACCOUNTS_DIR", "QD_MACHINE_IDENTITY_CACHE",
+             "QD_MACHINE_IDENTITY_CACHE_TTL", "QD_MACHINE_IDENTITY_RESET")
+_IDC_ORIG_ENV = {_k: os.environ.get(_k) for _k in _IDC_KEYS}
+_IDC_ORIG_RUN = A.run_runtime_info
+_IDC_TMP = _tf35.mkdtemp(prefix="qd-idcache-")
+_IDC_FILE = os.path.join(_IDC_TMP, "machine_identity.json")
+
+
+def _idc_env(**over):
+    """切换 ACCOUNTS_DIR 与三个开关，并清内存缓存与落盘文件。"""
+    os.environ["ACCOUNTS_DIR"] = over.get("accounts_dir") or _IDC_TMP
+    for _k in _IDC_KEYS[1:]:
+        if over.get(_k) is not None:
+            os.environ[_k] = str(over[_k])
+        else:
+            os.environ.pop(_k, None)
+    A._native_ident_cache.clear()
+    try:
+        os.remove(_IDC_FILE)
+    except OSError:
+        pass
+
+
+def _idc_stub(calls, fail=False):
+    def _f(realm, account_id=""):
+        calls.append((realm, account_id))
+        if fail:
+            return {}
+        n = len(calls)
+        return {"machineToken": "tok-%d" % n, "machineType": "ty%d" % n,
+                "machineCode": "co%d" % n, "vmInfo": {"isVm": False}}
+    return _f
+
+
+def _idc_read():
+    try:
+        with open(_IDC_FILE, encoding="utf-8") as _fh:
+            return json.load(_fh)
+    except Exception:
+        return None
+
+
+def _idc_tok(blob):
+    try:
+        return (blob.get("realm") or {}).get("cn", {}).get("machineToken")
+    except Exception:
+        return None
+
+
+try:
+    _idc_env()
+    _c1 = []
+    A.run_runtime_info = _idc_stub(_c1)
+    _i1 = A.native_machine_identity("cn", "u1")
+    _f1 = _idc_read()
+    check("#48-1 首次调用：无缓存 → 调组件一次并落盘（version/realm/三字段完整）",
+          len(_c1) == 1 and _i1.get("machineToken") == "tok-1"
+          and isinstance(_f1, dict) and _f1.get("version") == 1
+          and _idc_tok(_f1) == "tok-1"
+          and ((_f1.get("realm") or {}).get("cn", {}).get("machineType") == "ty1")
+          and ((_f1.get("realm") or {}).get("cn", {}).get("machineCode") == "co1"),
+          (_c1, _f1))
+
+    A._native_ident_cache.clear()
+    _c2 = []
+    A.run_runtime_info = _idc_stub(_c2)
+    _i2 = A.native_machine_identity("cn", "u2")
+    check("#48-2 【命门】落盘缓存命中：第二次调用**不触发组件**（桩计数=0）且身份逐字节相同",
+          len(_c2) == 0 and _i2.get("machineToken") == "tok-1"
+          and _i2.get("machineType") == "ty1", (_c2, _i2))
+
+    _c3 = []
+    A.run_runtime_info = _idc_stub(_c3)
+    _i3 = A.native_machine_identity("cn", "u3", force=True)
+    check("#48-3 force=True：必调组件并覆盖落盘缓存",
+          len(_c3) == 1 and _i3.get("machineToken") == "tok-1"
+          and _idc_tok(_idc_read()) == "tok-1", (_c3, _idc_read()))
+
+    # 设计 §3.2 行 3 的场景：缓存【已过期】→ 调组件 → 组件失败 → 回退到过期缓存。
+    # （缓存未过期时按行 2 根本不会调组件，那种构造断言不到"回退"路径。）
+    _idc_env(QD_MACHINE_IDENTITY_CACHE_TTL="1")
+    _c4a = []
+    A.run_runtime_info = _idc_stub(_c4a)
+    _i4a = A.native_machine_identity("cn", "u4")
+    _f4 = _idc_read()
+    try:
+        _f4["realm"]["cn"]["cached_at"] = time.time() - 10      # 人为过期
+        with open(_IDC_FILE, "w", encoding="utf-8") as _fh:
+            json.dump(_f4, _fh, ensure_ascii=False)
+    except Exception:
+        pass
+    A._native_ident_cache.clear()
+    _c4b = []
+    A.run_runtime_info = _idc_stub(_c4b, fail=True)
+    _i4b = A.native_machine_identity("cn", "u4b")
+    check("#48-4 组件失败但落盘有（过期）缓存 → 仍返回缓存身份，且不写坏缓存文件",
+          len(_c4a) == 1 and len(_c4b) == 1
+          and _i4b.get("machineToken") == _i4a.get("machineToken")
+          and _idc_tok(_idc_read()) == _i4a.get("machineToken"),
+          (_c4b, _i4b, _idc_read()))
+
+    _idc_env()
+    _c5 = []
+    A.run_runtime_info = _idc_stub(_c5, fail=True)
+    check("#48-5 组件失败且无缓存 → 返回 {}（现状不变）",
+          A.native_machine_identity("cn", "u5") == {} and len(_c5) == 1)
+
+    _idc_env(QD_MACHINE_IDENTITY_CACHE="off")
+    _c6 = []
+    A.run_runtime_info = _idc_stub(_c6)
+    A.native_machine_identity("cn", "u6")
+    check("#48-6 QD_MACHINE_IDENTITY_CACHE=off → 不落盘（行为同旧）",
+          _idc_read() is None and len(_c6) == 1, _idc_read())
+
+    _idc_env(QD_MACHINE_IDENTITY_CACHE_TTL="1")
+    _c7 = []
+    A.run_runtime_info = _idc_stub(_c7)
+    A.native_machine_identity("cn", "u7")
+    _f7 = _idc_read()
+    try:
+        _f7["realm"]["cn"]["cached_at"] = time.time() - 10
+        with open(_IDC_FILE, "w", encoding="utf-8") as _fh:
+            json.dump(_f7, _fh, ensure_ascii=False)
+    except Exception:
+        pass
+    A._native_ident_cache.clear()
+    A.native_machine_identity("cn", "u7b")
+    check("#48-7 TTL 正数：过期后重新调组件（缓存被刷新）", len(_c7) == 2, len(_c7))
+
+    _idc_env()
+    _c8a = []
+    A.run_runtime_info = _idc_stub(_c8a)
+    A.native_machine_identity("cn", "u8")
+    os.environ["QD_MACHINE_IDENTITY_RESET"] = "1"
+    A._native_ident_cache.clear()
+    _c8b = []
+    A.run_runtime_info = _idc_stub(_c8b)
+    _i8 = A.native_machine_identity("cn", "u8b")
+    check("#48-8 QD_MACHINE_IDENTITY_RESET=1 → 清空缓存并重新取身份",
+          len(_c8b) >= 1 and bool(_i8.get("machineToken")), (len(_c8a), len(_c8b)))
+
+    _idc_env()
+    with open(_IDC_FILE, "w", encoding="utf-8") as _fh:
+        _fh.write('{"version": 1, "realm": {"cn": {"machineToken": "trunc')
+    _c9 = []
+    A.run_runtime_info = _idc_stub(_c9)
+    _err9 = None
+    try:
+        _i9 = A.native_machine_identity("cn", "u9")
+    except Exception as _e9:
+        _err9 = _e9
+        _i9 = {}
+    check("#48-9 缓存文件损坏（截断 JSON）→ 不抛异常，回退调组件",
+          _err9 is None and len(_c9) == 1 and bool((_i9 or {}).get("machineToken")),
+          (_err9, len(_c9)))
+
+    _idc_env()
+    _c10 = []
+    _lk10 = _th35.Lock()
+
+    def _slow10(realm, account_id=""):
+        with _lk10:
+            _c10.append(1)
+            _n = len(_c10)
+        time.sleep(0.05)
+        return {"machineToken": "tok-%d" % _n, "machineType": "ty", "machineCode": "co"}
+
+    A.run_runtime_info = _slow10
+    _th35.Thread(target=lambda: A.native_machine_identity("cn", "t1")).start()
+    _th35.Thread(target=lambda: A.native_machine_identity("cn", "t2")).start()
+    time.sleep(0.6)
+    check("#48-10 并发首次：文件仍可解析（不损坏），且至少写入一次",
+          isinstance(_idc_read(), dict) and _idc_tok(_idc_read()) is not None,
+          _idc_read())
+
+    _idc_env()
+    _c11 = []
+    A.run_runtime_info = _idc_stub(_c11)
+    A.native_machine_identity("cn", "u11")
+    _tok_before11 = _idc_tok(_idc_read())
+    _acc11 = A.Account({"uid": "heal48", "realm": "cn", "accessToken": "dt-x"})
+    _acc11.machine_identity_source = "runtime-info"
+    _orig_get11 = A.Account._campaigns_get
+    _seq11 = []
+
+    def _cget11(self):
+        _seq11.append(1)
+        return (({"showCampaign": False} if len(_seq11) == 1
+                 else {"showCampaign": True}), 200, "")
+
+    A.Account._campaigns_get = _cget11
+    try:
+        _acc11.campaigns(force=True)
+    finally:
+        A.Account._campaigns_get = _orig_get11
+    _tok_after11 = _idc_tok(_idc_read())
+    check("#48-11 自愈路径：列表被拒 → force 刷新 → **落盘被更新**（不只更新内存）",
+          len(_c11) >= 2 and _tok_before11 != _tok_after11,
+          (_tok_before11, _tok_after11, len(_c11)))
+
+    _idc_env()
+    with open(_IDC_FILE, "w", encoding="utf-8") as _fh:
+        json.dump({"version": 1, "realm": {"cn": {"machineToken": ""}}}, _fh)
+    _c12 = []
+    A.run_runtime_info = _idc_stub(_c12)
+    _i12 = A.native_machine_identity("cn", "u12")
+    check("#48-12 缓存字段缺失（machineToken 空）→ 视为无缓存，回退调组件",
+          len(_c12) == 1 and (_i12 or {}).get("machineToken") == "tok-1",
+          (len(_c12), _i12))
+finally:
+    A.run_runtime_info = _IDC_ORIG_RUN
+    A._native_ident_cache.clear()
+    for _k in _IDC_KEYS:
+        if _IDC_ORIG_ENV[_k] is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _IDC_ORIG_ENV[_k]
+    _sh35.rmtree(_IDC_TMP, ignore_errors=True)
+
+print()
+print("[36] issue #20：签到结果文案分流（前端离线仿真：node 抽取 dashboard.html）")
+import shutil as _sh36
+import subprocess as _sp36
+import tempfile as _tf36
+
+_NODE36 = _sh36.which("node")
+if not _NODE36:
+    for _cand36 in (r"C:\Users\shuishui\AppData\Local\nvm\v24.19.0\node.exe",):
+        if os.path.isfile(_cand36):
+            _NODE36 = _cand36
+            break
+_DASH36 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+_JS36 = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.env.DASH36, 'utf-8');
+const mm = html.match(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/);
+const script = mm ? mm[1] : '';
+const s = script.indexOf('function fmtNextCheckin(x){');
+const e = script.indexOf('async function doCheckin(btn){');
+let pure = (s >= 0 && e > s) ? script.slice(s, e) : '';
+const MUT = process.env.MUTATE36 === '1';
+if (MUT) {
+  pure = 'function fmtNextCheckin(x){ return ""; }'
+       + ' function checkinOutcome(x){ const nm = x.nickname || String(x.uid||"").slice(0,6) || "账号";'
+       + ' return {state:"claimed", name: nm, text: nm + ": 签到成功"}; }'
+       + ' function checkinToastKind(rows){ return "ok"; }'
+       + ' function checkinToastText(rows){ return "每日签到: 签到成功"; }';
+}
+if (!pure) { console.log(JSON.stringify({missing:true})); process.exit(0); }
+const api = new Function(pure + '\nreturn {fmtNextCheckin:fmtNextCheckin,'
+  + ' checkinOutcome:checkinOutcome, checkinToastKind:checkinToastKind,'
+  + ' checkinToastText:checkinToastText};')();
+
+const NOTE = '10-05 10:00（UTC+8）';
+const CASES = {
+  claimed_new:   {uid:'aaa111', ok:true, claimed:['每日领 100'], earned_credit:100,
+                  message:'活动领取成功 +100 Credits（每日领 100）',
+                  next_available_at:1791123600, next_available_note:NOTE},
+  idle_with_msg: {uid:'bbb222', ok:true, claimed:[], message:'今日活动奖励已领取',
+                  next_available_at:1791123600, next_available_note:NOTE},
+  idle_no_msg:   {uid:'ccc333', ok:true, claimed:[],
+                  next_available_at:1791123600, next_available_note:NOTE},
+  idle_at_only:  {uid:'eee555', ok:true, claimed:[], next_available_at:1791123600},
+  fail_msg_only: {uid:'ddd444', ok:false, error:'', message:'token 已过期，请重新登录'},
+  legacy_credit: {uid:'fff666', ok:true, earned_credit:100, msg:''},
+  legacy_none:   {uid:'ggg777', ok:true, earned_credit:0, msg:''},
+};
+// kind 的判据是「已处理 row 的 state」，因此这里必须传 checkinOutcome 的产物
+const C_OK  = api.checkinOutcome({uid:'a1', ok:true, claimed:['活动A'], message:'到账'});
+const C_IDL = api.checkinOutcome({uid:'b2', ok:true, claimed:[], message:'已领',
+                                  next_available_note:NOTE});
+const C_FAIL= api.checkinOutcome({uid:'c3', ok:false, error:'失败原因'});
+const KIND_CASES = {
+  all_claimed: [C_OK],
+  claimed_plus_idle: [C_OK, C_IDL],
+  all_idle: [C_IDL],
+  fail_plus_idle: [C_FAIL, C_IDL],
+  all_fail: [C_FAIL],
+  empty_rows: [],
+};
+const out = {pure:true, cases:{}, kinds:{}};
+for (const k of Object.keys(CASES)) out.cases[k] = api.checkinOutcome(CASES[k]);
+for (const k of Object.keys(KIND_CASES)) {
+  out.kinds[k] = {kind: api.checkinToastKind(KIND_CASES[k]),
+                  text: api.checkinToastText(KIND_CASES[k])};
+}
+console.log(JSON.stringify(out));
+"""
+if not _NODE36:
+    skip("issue #20 前端分流仿真（本机无 node）", "node not found")
+else:
+    _dir36 = _tf36.mkdtemp(prefix="qd-js36-")
+    _jsf36 = os.path.join(_dir36, "probe.js")
+    with open(_jsf36, "w", encoding="utf-8") as _fh36:
+        _fh36.write(_JS36)
+
+    def _run36_tz(tz=None, mutate=False):
+        _env36 = dict(os.environ)
+        _env36["DASH36"] = _DASH36
+        _env36["MUTATE36"] = "1" if mutate else "0"
+        if tz:
+            _env36["TZ"] = tz
+        _r36 = _sp36.run([_NODE36, _jsf36], capture_output=True, text=True,
+                         encoding="utf-8", env=_env36, timeout=60)
+        try:
+            return json.loads((_r36.stdout or "").strip().splitlines()[-1])
+        except Exception:
+            return {"missing": True,
+                    "err": ((_r36.stderr or _r36.stdout or "")[:200])}
+
+    _b36 = _run36_tz()
+    check("#52 前端：能抽到分流纯函数组（fmtNextCheckin/checkinOutcome/"
+          "checkinToastKind/checkinToastText）",
+          isinstance(_b36, dict) and _b36.get("pure") is True,
+          json.dumps(_b36, ensure_ascii=False)[:200])
+    if isinstance(_b36, dict) and _b36.get("pure"):
+        _cs36 = _b36.get("cases") or {}
+        _ks36 = _b36.get("kinds") or {}
+
+        def _txt36(_k):
+            return str((_cs36.get(_k) or {}).get("text") or "")
+
+        def _st36(_k):
+            return (_cs36.get(_k) or {}).get("state")
+
+        check("#52 前端·claimed 非空 → state=claimed 且文案含服务端 message",
+              _st36("claimed_new") == "claimed"
+              and "活动领取成功 +100 Credits" in _txt36("claimed_new"),
+              (_st36("claimed_new"), _txt36("claimed_new")[:90]))
+        check("#52 前端·claimed 空（有 message）→ **不含「签到成功」** 且带下次可签到",
+              _st36("idle_with_msg") != "claimed"
+              and "签到成功" not in _txt36("idle_with_msg")
+              and "10-05 10:00" in _txt36("idle_with_msg"),
+              (_st36("idle_with_msg"), _txt36("idle_with_msg")[:110]))
+        check("#52 前端·claimed 空（无 message）→ 兜底文案 + 下次可签到",
+              _st36("idle_no_msg") != "claimed"
+              and "签到成功" not in _txt36("idle_no_msg")
+              and "本次没有新增积分" in _txt36("idle_no_msg")
+              and "10-05 10:00" in _txt36("idle_no_msg"),
+              (_st36("idle_no_msg"), _txt36("idle_no_msg")[:110]))
+        check("#52 前端·ok=false 只有 message → state=failed、文案含 message、非 undefined",
+              _st36("fail_msg_only") == "failed"
+              and "token 已过期" in _txt36("fail_msg_only")
+              and "undefined" not in _txt36("fail_msg_only"),
+              (_st36("fail_msg_only"), _txt36("fail_msg_only")[:110]))
+        check("#52 前端·旧字段兜底（earned_credit>0、无 claimed）→ 视为到账且含 +100",
+              _st36("legacy_credit") == "claimed" and "100" in _txt36("legacy_credit"),
+              (_st36("legacy_credit"), _txt36("legacy_credit")[:90]))
+        check("#52 前端·旧字段兜底（earned_credit=0）→ 不得出现「签到成功」",
+              _st36("legacy_none") != "claimed"
+              and "签到成功" not in _txt36("legacy_none"),
+              (_st36("legacy_none"), _txt36("legacy_none")[:90]))
+        _at36 = _txt36("idle_at_only")
+        check("#52 前端·note 缺失时用 next_available_at 兜底格式化（含 UTC+8 标注）",
+              "（UTC+8）" in _at36 and "-" in _at36 and _at36 != _txt36("idle_no_msg"),
+              _at36[:110])
+        _b36u = _run36_tz("UTC")
+        _b36n = _run36_tz("America/New_York")
+        check("#52 前端·时区无关：TZ=UTC / America/New_York / 默认 三份输出逐字节一致",
+              json.dumps(_b36u, ensure_ascii=False, sort_keys=True)
+              == json.dumps(_b36n, ensure_ascii=False, sort_keys=True)
+              == json.dumps(_b36, ensure_ascii=False, sort_keys=True),
+              ((_b36u.get("cases") or {}).get("idle_at_only", {}).get("text"),
+               (_b36n.get("cases") or {}).get("idle_at_only", {}).get("text")))
+        for _k36, _want36 in (("all_claimed", "ok"), ("claimed_plus_idle", "ok"),
+                              ("all_idle", "warn"), ("fail_plus_idle", "warn"),
+                              ("all_fail", "bad"), ("empty_rows", "warn")):
+            check("#52 前端·toast kind（%s）→ %s" % (_k36, _want36),
+                  (_ks36.get(_k36) or {}).get("kind") == _want36,
+                  (_k36, (_ks36.get(_k36) or {}).get("kind")))
+        _bm36 = _run36_tz(None, mutate=True)
+        _mt36 = str(((_bm36.get("cases") or {}).get("idle_with_msg") or {}).get("text") or "")
+        check("#52 能红证据：把分流改回「ok 就写死签到成功」→ claimed 空的两条断言必红",
+              "签到成功" in _mt36, _mt36[:80])
+    else:
+        skip("issue #20 前端分流断言（抽不到纯函数组）",
+             json.dumps(_b36, ensure_ascii=False)[:140])
+    _sh36.rmtree(_dir36, ignore_errors=True)
+
+print()
+print("[37] issue #20 后端：下次可签到窗口（next_checkin_window）边界 + 时区无关")
+import datetime as _dt37
+_UTC8_37 = _dt37.timezone(_dt37.timedelta(hours=8))
+
+
+def _ep37(_y, _m, _d, _hh=10, _mm=0, _ss=0):
+    return int(_dt37.datetime(_y, _m, _d, _hh, _mm, _ss, tzinfo=_UTC8_37).timestamp())
+
+
+check("#52 后端·函数与常量存在（next_checkin_window / CHECKIN_WINDOW_HOUR_UTC8=10）",
+      callable(getattr(A, "next_checkin_window", None))
+      and getattr(A, "CHECKIN_WINDOW_HOUR_UTC8", None) == 10,
+      (callable(getattr(A, "next_checkin_window", None)),
+       getattr(A, "CHECKIN_WINDOW_HOUR_UTC8", None)))
+
+for _label37, _now37, _exp_ep37, _exp_note37 in (
+        ("09:59:59（10:00 前 1 秒）", _ep37(2026, 10, 5, 9, 59, 59),
+         _ep37(2026, 10, 5, 10, 0, 0), "10-05 10:00（UTC+8）"),
+        ("10:00:00 整点（含）", _ep37(2026, 10, 5, 10, 0, 0),
+         _ep37(2026, 10, 6, 10, 0, 0), "10-06 10:00（UTC+8）"),
+        ("10:00:01（10:00 后 1 秒）", _ep37(2026, 10, 5, 10, 0, 1),
+         _ep37(2026, 10, 6, 10, 0, 0), "10-06 10:00（UTC+8）"),
+        ("08:59:00", _ep37(2026, 10, 5, 8, 59, 0),
+         _ep37(2026, 10, 5, 10, 0, 0), "10-05 10:00（UTC+8）"),
+        ("23:59:59（当日末尾）", _ep37(2026, 10, 5, 23, 59, 59),
+         _ep37(2026, 10, 6, 10, 0, 0), "10-06 10:00（UTC+8）"),
+        ("跨月 01-31 23:59", _ep37(2026, 1, 31, 23, 59, 0),
+         _ep37(2026, 2, 1, 10, 0, 0), "02-01 10:00（UTC+8）"),
+        ("跨年 12-31 23:59", _ep37(2026, 12, 31, 23, 59, 0),
+         _ep37(2027, 1, 1, 10, 0, 0), "01-01 10:00（UTC+8）"),
+        ("月末 04-30 10:00 后", _ep37(2026, 4, 30, 10, 0, 1),
+         _ep37(2026, 5, 1, 10, 0, 0), "05-01 10:00（UTC+8）")):
+    _at37, _note37 = A.next_checkin_window(_now37)
+    check("#52 后端·边界（%s）→ at 与 note 都正确" % _label37,
+          _at37 == _exp_ep37 and _note37 == _exp_note37,
+          (_at37, _exp_ep37, _note37, _exp_note37))
+
+_at37b, _note37b = A.next_checkin_window(_ep37(2026, 10, 5, 9, 0, 0))
+_recalc37 = _dt37.datetime.fromtimestamp(_at37b, _UTC8_37).strftime("%m-%d %H:%M") + "（UTC+8）"
+check("#52 后端·at 与 note 同源（note 可由 at 反算得到，不存在两处各算一遍）",
+      _recalc37 == _note37b, (_recalc37, _note37b))
+
+_at37c, _note37c = A.next_checkin_window(1791165600 - 1)
+check("#52 后端·契约样例：next_checkin_window(1791165600-1)[1] == 10-05 10:00（UTC+8）",
+      _note37c == "10-05 10:00（UTC+8）", (_at37c, _note37c))
+
+_here37 = os.path.dirname(os.path.abspath(__file__))
+_cmd37 = ("import sys; sys.path.insert(0, %r); import qoder_accounts as A; "
+          "print(A.next_checkin_window(1791165599))" % _here37)
+
+
+def _run_tz37(_tz):
+    _env37 = dict(os.environ)
+    _env37["TZ"] = _tz
+    _env37["PYTHONIOENCODING"] = "utf-8"
+    _r37 = _sp36.run([sys.executable, "-c", _cmd37], capture_output=True,
+                     text=True, encoding="utf-8", env=_env37, timeout=60)
+    return (_r37.stdout or "").strip()
+
+
+_tz37 = {_tz: _run_tz37(_tz) for _tz in ("UTC", "America/New_York", "Asia/Shanghai")}
+check("#52 后端·时区无关：TZ=UTC / America/New_York / Asia/Shanghai 三进程输出逐字节一致",
+      len(set(_tz37.values())) == 1 and "10-05 10:00（UTC+8）" in list(_tz37.values())[0],
+      _tz37)
 
 print()
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"

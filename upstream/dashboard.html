@@ -308,6 +308,12 @@ a:hover{text-decoration:underline}
         <span id="gatewayDot" class="dot" style="width:9px;height:9px"></span>
         <span id="activeGatewayName" style="font-size:20px;font-weight:700;color:var(--accent);letter-spacing:-.4px">国际版 (Global)</span>
       </div>
+      <div id="realmModeBar" style="display:flex;gap:4px;margin:4px 0 8px;flex-wrap:wrap">
+        <button class="range-btn" id="realmModeAuto" onclick="setRealmMode('auto')">自动</button>
+        <button class="range-btn" id="realmModeCn" onclick="setRealmMode('cn')">锁定国内</button>
+        <button class="range-btn" id="realmModeIntl" onclick="setRealmMode('intl')">锁定国际</button>
+      </div>
+      <div id="realmActual" style="font-size:11px;color:var(--dim);margin:0 0 8px;line-height:1.5">本次实际出口：—</div>
       <div style="margin-top:auto">
         <button class="toggle-realm-btn" id="btnToggleRealm" onclick="toggleActiveGatewayRealm()" style="cursor:pointer;width:100%;padding:7px 12px;font-size:12px">
           ⇄ 切换默认出口为【国内版】
@@ -370,7 +376,9 @@ a:hover{text-decoration:underline}
         <span class="badge warn" style="font-size:10px">A → B</span> 归一化时被挪档 ·
         <span class="badge bad" style="font-size:10px">→ 未下发</span> 请求了但被丢弃（模型无档位表）；
         <span style="color:var(--dim)">—</span> 表示该行没有档位字段（旧行 / 客户端未请求）</span>
-      <span><b>Key</b>＝仅显示标识（面板备注名 / 内置来源），不涉明文；<span style="color:var(--dim)">无 Key / 面板会话</span> 表示该行不带 Key（聚合时归入 (no-key) 桶）</span>
+      <span><b>Key</b>＝仅显示标识（面板备注名 / 内置来源），不涉明文；<span style="color:var(--dim)">无 Key / 面板会话</span> 表示该行不带 Key（聚合时归入「无 Key」桶）</span>
+      <span><b>区域</b>＝这条请求**实际走了哪个区**（usage 行逐请求落盘，确定值）。上方网关卡片里那条「最近一次对话的出口」
+        与本列**同源**（都读 usage 行），只是它只看最近一条并给出换区原因；逐条历史看这一列</span>
     </div>
     <div id="recentPagination" style="display:flex;align-items:center;justify-content:space-between;margin-top:14px;padding-top:12px;border-top:1px solid var(--line);font-size:12px;color:var(--dim);flex-wrap:wrap;gap:8px">
       <div id="recentPageInfo">第 1 / 1 页 · 共 0 条记录</div>
@@ -924,6 +932,97 @@ window.VIEW_REALM = "intl";
 window.MODELS_DATA = [];
 window.ACCOUNTS = [];
 
+/* ---- #26 自动路由：三态开关 + 本次实际出口 ----
+   隐式行为必须可见：自动换区是后台替用户做的决定，所以必须显示出来（响应头 X-Qoder-Realm → 界面）。
+   三态：auto（由环境变量控制，只能展示、不能在线改）/ cn / intl（显式锁定默认出口）。 */
+function realmModeOf(state){
+  const s = state || {};
+  if(s.auto_enabled) return 'auto';
+  return (s.current === 'cn') ? 'cn' : 'intl';
+}
+// 卡片「最近一次对话的出口」：数据源＝最近请求表的 **usage 行**（持久化、可查历史）。
+// 响应头那条数据源已按契约切断（管理端点永不返回 X-Qoder-Realm），这里不再读任何响应头。
+// 三态严格区分——**不把「不知道」与「没发生」混为一谈**：
+//   realm_reason 键不存在 → 字段上线前的旧行（不知道） ／ "" → 没换区（没发生） ／ 其余 → 换区 + 确定性原因
+function realmActualNote(rows, state){
+  const list = Array.isArray(rows) ? rows : [];
+  const nameOf = r => (r === 'cn' ? '国内版' : (r === 'intl' ? '国际版' : (r || '未知')));
+  // 每个原因都带上「我能做什么」——比只说「在哪推走的」有用（natie 的建议）
+  const WHY = { model_missing: '当前区官方清单里没有这个模型：它天生只在另一区提供，加账号也改变不了；想固定用它就把默认出口切到那一区',
+                no_account: '模型在当前区本来有（或无法判断），是账号可用性把它推走的：给默认出口那一区加一个可用账号即可，不加则会一直走自动路由' };
+  const stamp = r => (r && r.iso) ? String(r.iso).replace('T', ' ').slice(5) : '';
+  if(!list.length){
+    return { tone: 'dim', head: '最近一次对话的出口：还不确定',
+             detail: '还没有可读的 usage 行；拿不到「最近一次对话」时不显示默认值（那是假指示）' };
+  }
+  // 最近请求表第 1 页时间倒序：取**最近一条非 error 的行**（失败行可能没有真实出账区，不该拿它当结论）
+  const newest = list.find(r => !r.error) || list[0];
+  const at = stamp(newest);
+  const hasKey = Object.prototype.hasOwnProperty.call(newest, 'realm_reason');
+  const knownCount = list.filter(r => Object.prototype.hasOwnProperty.call(r, 'realm_reason')).length;
+  const switchedCount = list.filter(r => r.realm_reason === 'model_missing' || r.realm_reason === 'no_account').length;
+  const scope = '（样本：最近请求表当前页 ' + list.length + ' 条）';
+  if(!hasKey){
+    return { tone: 'dim', head: '最近一次对话的出口：未知（旧记录）',
+             detail: '这一行没有 realm_reason 字段：它产生于该字段上线之前' + scope + '，据此判断不了换没换区（不猜，也不显示成「没换区」）' };
+  }
+  if(newest.realm_reason){
+    const why = WHY[newest.realm_reason] || ('后端原因码 ' + newest.realm_reason);
+    return { tone: 'warn', head: '最近一次对话（' + at + '）走了 ' + nameOf(newest.realm) + '：被自动换区',
+             detail: '原因：' + why + '；' + scope };
+  }
+  const never = (switchedCount === 0 && knownCount === list.length);
+  return { tone: 'dim', head: '最近一次对话（' + at + '）走了 ' + nameOf(newest.realm) + '：未换区',
+           detail: (never
+             ? '本页 ' + list.length + ' 条样本里没有出现过自动换区（「从没换过」的完整历史要看 usage 行累计，这里只代表当前样本）'
+             : '本页样本里有 ' + switchedCount + ' 条被自动换过区，最近这一条没有') + '；' + scope };
+}
+function renderRealmMode(){
+  const st = window.REALM_STATE || {};
+  const mode = realmModeOf(st);
+  [['auto', 'realmModeAuto'], ['cn', 'realmModeCn'], ['intl', 'realmModeIntl']].forEach(pair => {
+    const el = document.getElementById(pair[1]);
+    if(el) el.classList.toggle('active', pair[0] === mode);
+  });
+  const bar = document.getElementById('realmModeBar');
+  if(bar){
+    const env = st.auto_env || 'QD_AUTO_REALM';
+    bar.title = st.auto_enabled
+      ? ('自动路由已开启（环境变量 ' + env + '）：当前区缺模型或没有可用账号时会自动换区；改这个开关要重启网关，面板只展示状态')
+      : ('未开启自动路由：恒用锁定出口；要开启需设置环境变量 ' + env + ' 并重启网关');
+  }
+}
+function renderRealmActual(){
+  const el = document.getElementById('realmActual');
+  if(!el) return;
+  const note = realmActualNote((RECENT_SNAPSHOT || {}).rows, window.REALM_STATE);
+  el.innerHTML = '<b>' + esc(note.head) + '</b>' + (note.detail ? '<br>' + esc(note.detail) : '');
+  el.style.color = (note.tone === 'warn') ? 'var(--warn)' : 'var(--dim)';
+}
+async function setGatewayRealm(realm){
+  try {
+    const res = await postJSON('/realm', {realm: realm});
+    window.ACTIVE_GATEWAY_REALM = res.current || realm;
+    window.VIEW_REALM = window.ACTIVE_GATEWAY_REALM;
+    toast('默认出口已设为: ' + (window.ACTIVE_GATEWAY_REALM === 'intl' ? '国际版' : '国内版'));
+    window.updateUI();
+    await loadAccounts();
+    await loadModels();
+    await refresh();
+  } catch(e) {
+    toast('切换失败: ' + e.message, 'bad');
+  }
+}
+function setRealmMode(mode){
+  const st = window.REALM_STATE || {};
+  if(mode === 'auto'){
+    toast('自动路由由环境变量 ' + (st.auto_env || 'QD_AUTO_REALM') + ' 控制，改动需要重启网关；面板只展示当前状态', 'warn');
+    return;
+  }
+  if(st.auto_enabled) toast('自动路由已开启：锁定只改默认出口，当前区缺模型/无可用账号时仍会自动换区', 'warn');
+  setGatewayRealm(mode);
+}
+
 function updateUI(){
   const isIntlView = (window.VIEW_REALM === "intl");
   const tIntl = document.getElementById("tabIntl");
@@ -999,6 +1098,8 @@ function updateUI(){
   if(elCnCred) elCnCred.textContent = hasCnCred ? fmt(cnCred) : "—";
   const elCnAcct = document.getElementById("tabCnAccts");
   if(elCnAcct) elCnAcct.textContent = cnAccts.length;
+  renderRealmMode();      // #26：自动 / 锁定国内 / 锁定国际 三态
+  renderRealmActual();    // #26：本次实际出口（有头=换过，无头=没换）
 };
 
 // —— 项目新版本检测（运行信息卡片；自动检查一次 + 手动「立即检查」）——
@@ -1075,25 +1176,18 @@ async function switchViewRealm(r){
 };
 
 async function toggleActiveGatewayRealm(){
-  const next = (window.ACTIVE_GATEWAY_REALM === "intl" ? "cn" : "intl");
-  try {
-    const res = await postJSON("/realm", {realm: next});
-    window.ACTIVE_GATEWAY_REALM = res.current || next;
-    toast("网关默认上游已切换并永久保存为: " + (window.ACTIVE_GATEWAY_REALM === "intl" ? "国际版" : "国内版"));
-    window.VIEW_REALM = window.ACTIVE_GATEWAY_REALM;
-    window.updateUI();
-    await loadAccounts();
-    await loadModels();
-    await refresh();
-  }catch(e){
-    toast("切换失败: " + e.message, "bad");
-  }
+  // 保留原按钮：仍是对调两区（实现委托给 setGatewayRealm，避免两份切换逻辑）
+  return setGatewayRealm(window.ACTIVE_GATEWAY_REALM === "intl" ? "cn" : "intl");
 };
 
 async function initRealm(preserveView){
   try{
     const r = await getJSON("/realm");
     if(r && r.current) window.ACTIVE_GATEWAY_REALM = r.current;
+    // #26：auto_enabled 来自环境变量（只读展示）；current 是锁定生效值
+    window.REALM_STATE = { current: (r && r.current) || window.ACTIVE_GATEWAY_REALM,
+                           auto_enabled: !!(r && r.auto_enabled),
+                           auto_env: (r && r.auto_env) || "QD_AUTO_REALM" };
   } catch(e){}
   // preserveView=true：只同步"网关默认出口"，**不动用户当前正在看的视图**
   // （此前 doCheckin 等动作后会调用本函数，导致视图被重置回网关默认区，
@@ -1264,7 +1358,14 @@ function renderAvailableModels(){
     }
 
     // 5. 模型 ID：官方模型名（唯一填写值）+ 未开通套餐的官方原因 + 官方介绍
-    const idLines = ['<div><b>' + esc(m.id) + '</b></div>'];
+    // #26 步4：单区独有的模型才给这个字段（双区都有的不给，避免把「都能用」误标成独占）
+    const excl = (m.realm_exclusive === 'intl' || m.realm_exclusive === 'cn') ? m.realm_exclusive : null;
+    const exclBadge = excl
+      ? ' <span class="' + (excl === 'intl' ? 'realm-badge-intl' : 'realm-badge-cn') + '" style="font-size:10px" title="'
+        + esc('该模型只在' + (excl === 'intl' ? '国际版' : '国内版') + '提供：默认出口在另一区时会被自动路由改走（未开自动路由则该请求不可用）')
+        + '">仅' + (excl === 'intl' ? '国际版' : '国内版') + '</span>'
+      : '';
+    const idLines = ['<div><b>' + esc(m.id) + '</b>' + exclBadge + '</div>'];
     if(m.enabled === false){
       const reason = m.disabled_reason || '需要升级或购买千问官方套餐开放';
       idLines.push('<div style="margin-top:3px"><span class="badge warn" title="' + esc(reason)
@@ -1424,7 +1525,11 @@ function renderGrowthTasks(r){
     const sum = r.summary || {};
     const accts = r.accounts || [];
     const streak = sum.streak_days || 0;
-    const energy = sum.energy || 0;
+    // #25：退化账本是「未知」而不是 0 —— 显示 0 会让用户以为额度耗尽（issue 报告者正是被这点误导）。
+    // 判据：后端 credits_unknown=True（单账号）或显式 energy=null；energy===0 才是真·归零，要照实显示 0。
+    const unknownUids = Array.isArray(sum.credits_unknown_accounts) ? sum.credits_unknown_accounts : [];
+    const energyUnknown = (sum.credits_unknown === true) || (sum.energy === null);
+    const energy = energyUnknown ? null : (sum.energy || 0);
     const tr = sum.travel || {};
 
     // 全部账号（批量）视图：卡片改成合计口径，活动行已按活动聚合并标注每账号资格
@@ -1432,7 +1537,15 @@ function renderGrowthTasks(r){
     const lblStk = document.getElementById('stkLabel');
     const lblNrg = document.getElementById('nrgLabel');
     if(lblStk) lblStk.textContent = isAll ? '连续签到（批量视图）' : '连续签到天数';
-    if(lblNrg) lblNrg.textContent = isAll ? '合计积分余额（全部账号）' : '积分额度余额';
+    if(lblNrg){
+      // 合计视图必须点名「已排除 N 个未知账号」：否则用户拿这个合计去和账号卡片对账，会以为少算了
+      lblNrg.textContent = isAll
+        ? (unknownUids.length ? ('合计积分余额（已排除 ' + unknownUids.length + ' 个未知账号）') : '合计积分余额（全部账号）')
+        : (energyUnknown ? '积分额度余额（未知）' : '积分额度余额');
+      lblNrg.title = unknownUids.length
+        ? ('未知账号（账本退化响应，未并入合计、也不当作 0）：' + unknownUids.map(u => String(u).slice(0, 8)).join('、'))
+        : (energyUnknown ? (sum.energy_note || '余额未知（等待下次成功刷新）') : '');
+    }
     renderCodePanel(sum);
 
     const sel = document.getElementById("growthAcctSelect");
@@ -1446,7 +1559,14 @@ function renderGrowthTasks(r){
     const elStk = document.getElementById("stkDays");
     if(elStk) elStk.textContent = streak + ' 天';
     const elNrg = document.getElementById("nrgBalance");
-    if(elNrg) elNrg.textContent = energy;
+    if(elNrg){
+      if(energyUnknown){
+        elNrg.innerHTML = '<span style="color:var(--warn);font-size:16px" title="'
+          + esc(sum.energy_note || '余额未知（等待下次成功刷新）') + '">未知</span>';
+      } else {
+        elNrg.textContent = energy;   // 含 0：真·耗尽显示 0，与「未知」严格区分
+      }
+    }
 
     const elCat = document.getElementById("catState");
     const elCatDesc = document.getElementById("catDesc");
@@ -1791,6 +1911,8 @@ async function getJSON(url){
   const r = await fetch(url, {cache:'no-store', headers: authHeaders()});
   await throwPanelAuthError(r);
   if(!r.ok) throw new Error(r.status);
+  // #26 契约冻结：出口相关的响应头只在 chat 类请求且自动换区时出现，管理端点永不带（读到只会是旧进程残留），
+  // 因此这里**不再读任何响应头**；面板改从 usage 行读「最近一次对话的出口」（realm + realm_reason）。
   return r.json();
 }
 async function postJSON(url, body){
@@ -2468,6 +2590,13 @@ function keyDisplay(id){
   }
   return { label: esc(hit.name || '未命名'), sub: esc(short), cls: '', title: 'Key 标识 ' + esc(raw) };
 }
+// usage 行的区域：**确定值**（落盘时就写了，不是推断）。这一列逐请求、来自 usage 行；
+// 网关卡片那条「最近一次对话的出口」与本列**同源**（也读 usage 行）——响应头那条数据源已按契约切断。
+function realmBadgeOf(realm){
+  if(realm === 'intl') return '<span class="realm-badge-intl" style="font-size:10px">国际版</span>';
+  if(realm === 'cn') return '<span class="realm-badge-cn" style="font-size:10px">国内版</span>';
+  return '<span style="color:var(--dim)" title="该行没有记录区域（旧行或未落盘）">—</span>';
+}
 function keyCell(r){
   const d = keyDisplay(r.key_id);
   if(d.cls) return '<span class="' + d.cls + '" title="' + d.title + '">' + d.label + (d.sub ? ' ' + d.sub : '') + '</span>';
@@ -2677,13 +2806,14 @@ async function refreshInner(){
   const countEl = document.getElementById('recentCount');
   if(countEl) countEl.textContent = '(第 ' + RECENT_PAGE + ' 页 / 共 ' + fmt(total) + ' 条)';
   document.getElementById('recent').innerHTML = rows.length ?
-    '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th></tr></thead><tbody>'
+    '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th style="text-align:center;width:72px">区域</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th></tr></thead><tbody>'
     + rows.map(r => '<tr>'
         + '<td class="mono">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
         + '<td class="mono">' + esc(r.model) + '</td>'
         + '<td class="mono" style="font-size:11px;color:var(--dim)">' + esc((r.account||'—').slice(0,8)) + '</td>'
         + '<td style="text-align:left">' + keyCell(r) + '</td>'
         + '<td style="text-align:left;white-space:nowrap">' + effortCell(r) + '</td>'
+        + '<td style="text-align:center;white-space:nowrap">' + realmBadgeOf(r.realm) + '</td>'
         + '<td><span class="badge ' + (r.stream?'s':'') + '">' + (r.stream?'流式':'非流式') + '</span></td>'
         + '<td>' + (r.error ? '<span class="badge bad">失败</span>' : (r.elapsed_ms!=null ? fmt(r.elapsed_ms)+' ms' : '—')) + '</td>'
         + '<td>' + (r.ttft_ms!=null ? fmt(r.ttft_ms)+' ms' : '—') + '</td>'
@@ -2696,6 +2826,7 @@ async function refreshInner(){
       + '</tr>').join('') + '</tbody></table>'
     : '<div class="empty">还没有请求记录</div>';
   renderEffortByKey();   // 样本变了就重算档位分布
+  renderRealmActual();   // #26：卡片「最近一次对话的出口」也读这批 usage 行（不再依赖响应头）
 }
 
 (async function initDashboard(){

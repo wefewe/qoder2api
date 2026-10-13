@@ -84,6 +84,25 @@
 
    这三条都只动**备份副本**（`%TEMP%` 下先备份、跑完立即还原），原文件不留痕。
 
+## 第三步：上游异常形状 + Anthropic 档位接线（本轮）
+
+| 套件 | 类型 | 覆盖 |
+|---|---|---|
+| `_test_stream_guards.py` | 守卫（离线纯函数） | 上游信封 body **不保证是 JSON object**（实测有裸数组/标量）。三处守卫 `clean_chunk` / `iter_inner_sse` / `aggregate_stream` 遇非 dict 帧：① 不抛异常；② 不吞后续帧（异常帧夹在中间时正文仍完整）；③ 既有语义不回退（噪声清洗、usage 首个优先、正文折叠）；④ 集成一条：异常帧走完整 Anthropic 流式管线 |
+| `_test_anthropic_wiring_meta.py` | 接线（HTTP 层 + 端到端） | `/v1/messages` 的 `thinking.budget_tokens` 要经 `catalog_meta` 才能映射成 `reasoning_effort`。断言拦在 `open_upstream` **唯一出站口**（不是「`messages_to_chat` 被调用过」）：实际交给上游的 `chat_req` 必须带档位、且档位在该模型官方档位表内；另加端到端「档位真的写进上游 `parameters`」与两条静态钉住 |
+
+### 能红自证（本轮两条）
+
+1. **stream_guards**：删掉 `qoder_proxy.py` 里三处 `isinstance(..., dict)` 守卫（回到改动前形状）
+   → 6 条 `[FAIL] ... AttributeError: 'list' object has no attribute 'get'` → RED exit 1；恢复后 GREEN 20/20。
+2. **anthropic_wiring_meta**：把 `_handle_anthropic` 的 `catalog_meta_for(...)` 下传改回
+   `messages_to_chat(payload)` → `[FAIL] model=qmodel_38max：chat_req.reasoning_effort 非空` 等 6 条 → RED exit 1；恢复后 GREEN 16/16。
+
+   同样只动备份副本；跑完 `git diff --stat` 与本轮改动一致，原文件无变异痕迹。
+
+> 两个套件都把自己的 `QD_PROXY_USAGE_DIR` 指到 `tempfile.mkdtemp()`：被桩中止的请求
+> 也会走 `record_error` 落盘，不能写进仓库的 `usage/`（并发编排下是跨进程共享路径）。
+
 ## 迁移期纪律（每批迁移后都要过一遍）
 
 ### 1. 路径：一律基于 `__file__`，绝不用 cwd
@@ -148,3 +167,79 @@ shutil/struct/sys/tarfile/tempfile/time`）全部模块级 import 并放进 `__a
 `dep_scan.py --leaf-only` 当前**没有输出** —— 跑完 55 个段后，**没有一个段是纯叶子**：
 段与段之间共享大量全局（`time`/`base64`/`payload`/`url` 等是显式共享，`_A`/`_orig_sleep2`
 这类是隐式继承）。这与第三批的回滚现象完全一致，也直接支持「legacy 作终态」的结论。
+
+---
+
+## 夹具纪律：**所有出站函数默认桩住**（2026-10-13，由一次真实踩坑立规）
+
+**事故**：写 #25 的「文案矩阵」探针时只桩了 `Account.campaigns()`，漏桩 `Account.claim_campaign()`。
+夹具里那条 `CLAIMABLE` 活动于是走了真实 `claim_campaign` —— 探针**真的向 qoder.sh 打了一次
+claim POST**（用的是假 token，回 401 `TOKEN_EXPIRE`，无状态改变，但性质是"离线夹具出网了"）。
+
+**为什么危险**：这类探针通常带着**真实账号的 token**（或仓库里的 accounts/*.json），漏桩就不是
+"打一次 401"，而是真的领取/刷新/写账本 —— 夹具本该零副作用。
+
+**规矩**：
+
+1. 夹具**开头**统一把所有出站函数桩掉，再写用例；宁可多桩一行，不要赌"这条路径不会走到"：
+   - `qoder_accounts.http_json`（**唯一真正的网络出口**，拦它最划算）；
+   - `Account.campaigns` / `claim_campaign` / `checkin` / `campaign_checkin` /
+     `fetch_credits` / `fetch_plan` / `refresh` / `native_machine_identity`；
+   - `Account.save` / `_stamp_checkin`（防写盘）；
+   - 调度器侧 `run_keepalive` / `run_batch_checkin` / `time.sleep`（防真等）。
+2. 环境隔离：`ACCOUNTS_DIR` / `QD_PROXY_USAGE_DIR` 指向 `tempfile.mkdtemp()`，
+   `QD_NATIVE_IDENTITY=0`（不拉起官方原生桥）。
+3. **自证**：夹具跑完打印一条"出网计数"（例如 `http_json` 的调用次数）—— 期望 0；
+   非 0 就是漏桩，直接判红。
+4. 变异/能红证据只在**副本**上做（见上文 reserve_blocked 的示范），原文件不留痕。
+
+## 桩的保真度纪律（棉花糖这轮踩出来的两条）
+
+这两条与前面记的「锚点缺失即抛」「按函数而非区间做纯度检查」是同一类：**桩的保真度**
+直接决定断言的可信度 —— 桩太粗会假绿，桩不对会假红。
+
+### 1. 元素桩要照 DOM 语义做
+
+`textContent` / `innerHTML` 的 setter 会把值转成字符串。用普通对象字面量当元素桩时，
+`el.textContent = 1234` 之后读回来是 `'1234'`，断言 `el.textContent === 1234` 会直接红
+（实测：棉花糖第一版就这么红了一次）。正确做法：
+
+    const el = {};
+    Object.defineProperty(el, 'textContent', {
+      get() { return this._t ?? ''; },
+      set(v) { this._t = String(v); },   // 照 DOM 语义：任何值都变字符串
+    });
+
+同理，`classList` 需要真的维护一个 Set（否则 `contains()` 恒假、`add()` 无痕），
+`children` / `appendChild` 要真的累积 —— 否则「追加 vs 重建」这类行为断言测不出来。
+
+### 2. 被测函数调用的兄弟函数要显式注入空桩
+
+被测函数若会调用同页面的另一个渲染函数（例如 `renderCodePanel`），必须把它作为参数
+注入一个空桩。否则一个单元断言会顺带拖进半个页面：任何兄弟函数的改动都会让这条断言红，
+而它俩其实没有语义关系。
+
+判据：**一条断言的失败原因应当唯一指向它要守的那件事**。做不到就说明注入面没划清。
+
+## 基线数字（提交前核对用）
+
+**用途**：新增/删除套件时，`python tests/run_all.py` 的 `TOTAL N checks` 是本仓测试覆盖的
+**守门数值**。它下降通常意味着「断言少了但测试仍然绿」—— 这是最难发现的一类缺失
+（没有红、没有报错，只是覆盖变窄了），所以每次提交前后都值得看一眼。
+
+**基线（v1.3.7 · 2026-10-13）**：
+
+| 口径 | 数值 |
+|---|---|
+| 套件数 | **28 suites** |
+| 全部断言 | **1005 checks** |
+| 结果 | 0 failed / exit 0 |
+| 前端六套件小计 | **105**（9/19/19/15/12/31） |
+| legacy 套件 | 630（其中 4 条 SKIP，语义见 `_test_qoder.py` 的 SUMMARY 说明） |
+
+**提交前建议三步**：
+
+1. `python tests/run_all.py`，确认 `0 failed` 且 `TOTAL` 不低于上表；
+2. `git status --porcelain`，确认没有 `_mig*` / `*.bak*` / `*.mutbak` 之类的临时残留；
+3. `git add -A`（**不要只用具体文件名 add** —— 新增的套件文件会被静默漏掉，表现为
+   「测试仍然全绿，但总数比基线低」，例如 105 变 97）。

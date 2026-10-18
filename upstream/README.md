@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.4.5-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.5.1-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -493,6 +493,70 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.5.1
+
+**⚠️ 行为变更（fail-closed，issue #37）**
+
+「工具协议回声 + 内层 arguments 非法」不再以「一句说明 + 普通 stop」结束，改为**协议级失败**：
+
+| 出口 | 行为 |
+|---|---|
+| `/v1/chat/completions` 流式 | `data: {"error": …}` → `[DONE]`；**不再发** stop/tool_calls 正常收尾 |
+| `/v1/chat/completions` 非流式 | **HTTP 502** + 标准错误信封 |
+| `/v1/responses` 流式 | `response.failed`；**不再发** `response.completed` |
+| `/v1/messages`（Anthropic） | `event: error`；**不再发** `message_stop` |
+
+动机：旧行为对按「错误帧 + 结束状态」驱动工具循环的客户端等价于**成功**（`stopReason=end_turn`、`hasFatalError=false`），工具没执行却把任务当完成。
+
+**🐛 问题修复**
+
+- **协议回声的围栏 / DSML 组合识别**（#37）：`_echo_with_bad_args` 此前只在「整串被围栏包住」时才剥围栏——流式里 `_find_marker_split` 先把开围栏切进散文，hold 只剩 `marker + 数组 + 闭围栏`，于是认不出、marker 原样吐给客户端。现在首尾围栏残余（含 `json` 标注）与 DSML 尾标签**交替剥两轮**再判定。
+- **判定顺序**（#37）：三处出口（流式收尾 / 非流式聚合 / Responses）原先 `_leaked_partial_droppable` 在前，会把「外层数组合法 + 内层参数坏 + DSML 尾」误判成 #9 截断回声**静默吞掉**并照常 stop。现在 fail-closed 判定**提前**，与 #9 互斥（后者要求外层数组解析失败）。
+- **小分块漏检**（#37）：`_json_array_prefix_ok` 的 Extra data 分支在 `tail = "```\n</"` 时既不是围栏前缀、又被 `_dsml_tail_holdable` 当成散文 → 候选在**流式中途**被证伪，1/16 字符每帧下整块当正文补发。现在 tail 以完整闭围栏开头时先剥掉再判。
+
+**🐛 其他修正**
+
+- 坏参数**不自动重试、不冷却账号**：`should_retry_envelope` 对该异常直接 False（避免重复计费），账号冷却/归因入口直接返回（模型内容问题不等于账号不可用）。
+- 错误详情是**固定串**（不含实际参数、路径、正文）；面向客户端的文案单独给出可读中文。
+
+**🐛 问题修复（#48 前缀缓存）**
+
+- **历史工具结果削减随请求形态滑动，导致上游前缀缓存每轮失效**：旧规则用 `_current_turn_start` 从末尾往前找最后一条 user 消息——连续工具调用时 `_cur_start=1`（全不削），用户一插话 `_cur_start` 跳到末尾（**每条**历史工具结果全部重削）。同一条历史消息在不同轮次序列化成不同字节，上游从第一条被削处起整段不命中（实测命中率 95-99% → 8%）。
+  现在默认 **`tail` 策略**：只保护**最后 1 条**工具结果，更早的一律削；一旦被削，字节里不再含随轮次变化的成分。`QD_TOOL_RESULT_SCOPE` 可选 `tail`（默认）/ `all`（全部削，缓存最稳）/ `turn`（旧行为，仅兼容）；`QD_TOOL_RESULT_KEEP_TAIL` 可调保护条数。
+- **省略标记去掉字数统计**：`[[qoder-proxy: 已省略 N 字符历史工具结果…]]` → 固定串 `[[qoder-proxy: 已省略中间内容…]]`。带数字的标记会让「同一条结果」在内容变化/重试时产生不同字节，同样打断前缀。
+
+**验证**：全量 **36 suites / 1298 checks / 0 failed**（新增 `tests/_test_prefix_stability.py` 12 条：两种请求形态字节一致、标记无数字、三种 scope、keep=0 回退）。
+
+
+**⚠️ 两个契约细节**（写在这里以免误判）
+
+- 混合批次要 fail-closed，数组里**每个** `name` 都必须在本次声明集合内；只要有一个未声明，整块仍走原有 fail-open（不把普通示例当错误）。
+- 「内层真实 LF」必须落在 JSON **字符串内部**（`{"body":"line1<LF>line2"}`）；落在 token 之间的换行是合法 JSON，属「合法参数」路径。
+
+**验证**：全量 **35 suites / 1285 checks / 0 failed**（新增 `tests/_test_issue37_fail_closed.py` 103 条）；另有 `tests/manual_issue37_e2e.py` 真起网关验证四组 HTTP 行为（200+error 帧 / 502 / response.failed / event:error）。
+
+### v1.5.0
+
+**✨ 新增功能**
+
+- **面板会话跨重启存活**（PR #46 / cliffcat）：token 改为自校验签名（`<过期>.<nonce>.<hmac>`），密钥持久化在 `accounts/settings.json`；网关重启/升级不再强制重新登录，改密码时换密钥一次性踢掉所有浏览器。顺带修了三处：`settings.json` 解析失败时**拒绝回写**（避免一次瞬时 IO 抹掉密码哈希与全部 API Key）、非 ASCII token 不再打断连接、`revoke_all()` 不再持锁做磁盘 IO。
+- **近 7 / 30 天 Token 用量图**（PR #46）：新端点 `/usage/daily?days=7|30&group=model|realm|key|account`，纯手写 DOM 堆叠柱状图（零第三方依赖）；日志倒读、内存 O(1)，脏行跳过，DST 时区按自然日重算。
+- **独立于护栏的余额刷新**（#43）：请求线程只给账号打标（不联网），后台默认每 **5 分钟**合并刷新「真正用过的号」，空闲不轮询，用完补完最后一次；失败保留旧快照并按 60s→15min 退避重试。`QD_CREDITS_USAGE_INTERVAL` 可调。
+
+**🐛 问题修复**
+
+- **流式 tool_call.id 为空导致下游会话整份报废**（#47）：上游偶发缺 id 的增量帧被原样透传，客户端落盘 `id:""` 后整份会话无法加载。现在在**唯一流式出口** `recover_leaked_tool_calls` 统一兜底：有 id 原样透传、缺 id 补 `call_` 并按 index 记忆（分帧不换号），非工具帧字节级不变。
+- **面板余额长时间不更新**（#43）：此前余额刷新绑在额度护栏上（阈值全 0 时线程根本不存在）。现在与护栏解耦；账号行显示「更新于 HH:MM / 待刷新 / 查询中 / 查询失败（显示旧快照）」，不再把旧快照伪装成刚更新。
+- **签到积分不显示**（#40 后续）：签到成功（含 `ALREADY_CLAIMED`）后**立刻刷新余额**，奖励积分即时反映到面板。
+- **国际版空额度一片空白**（#40 后续）：上游返回全 0 退化体时不再只留日志——写降级标记并在面板显示 **`0*` + 「空额度」**（悬停可见上游原因与时间），而不是「未查询」。
+- **深色模式 API Key 表单白底**（#44 / PR #45）：编辑卡片内联 `background:#ffffff` 改为 `var(--panel)`。
+
+**🎨 体验优化**（PR #46）：用量表「占比」分母改为表内可见行之和（不再最大行恒 100%）、TTFT/输入输出显式换行不再从数字中间折行、`.range-btn:hover` 蓝底深字修正；展示路径统一走 `effective_remain()`（团队账号共享额度不再显示 0）。
+
+**⚠️ 其他变更**：新增 2 个回归套件（`_test_stream_tool_ids.py` 12 条 / `_test_credits_refresh.py` 27 条），PR #46 自带 2 个（`_test_usage_daily.py` / `_test_panel_session_persist.py`）。
+
+**验证**：全量 **34 suites / 1180 checks / 0 failed**。
 
 ### v1.4.5
 

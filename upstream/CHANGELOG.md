@@ -9,6 +9,46 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.6.12
+
+**🐛 问题修复**
+
+- **账号测试可能测到别的账号**（#86）：`/accounts/test` 调 `open_upstream()` 时没钉账号，池子会按会话粘性/轮询挑一个——点了 A 号实际测的是 B 号，结果自然对不上。
+  现在 `open_upstream()` 新增 `only_account=` 参数：
+  - 账号测试固定使用被点的那个号（不参与轮换、不走粘性）；
+  - 区域跟随该账号（避免自动路由把请求换到别的区）；
+  - 按「单账号池」处理（冷却压到 3s，不会因为测试失败把整个池子的轮换节奏带偏）；
+  - 成功时清理的是**实际**被测账号的错误状态（`acc.clear_error()`），而不是最初选中的那个。
+  不传该参数时行为与之前逐字节一致（普通请求仍走池）。
+
+**验证**：新增 `tests/_test_issue86_account_test.py`（8 条：源码守卫 + 钉死账号不会被池替换 + 未钉死仍走池）；全量 **67 suites / 1878 checks / 0 failed**。
+
+## v1.6.11
+
+**✨ 新增：账号行显示「今日是否已签到」与「积分变化」**
+
+- **今日签到徽标**：账号名旁直接显示 **✓ 今日已签到**（绿）或 **⏱ 今日未签到**（黄），悬停可看具体日期（`Account.public()` 新增 `checkedInToday` / `lastCheckinDate`）。
+- **积分变化 chip**：积分列在余额后显示最近一次变化——签到 `+100`（绿）/ 消耗 `-35`（红），带弹出动画与时间悬停提示。
+  - 只在数值**真的变化**时更新（`fetch_credits` 对比上一次 `remain_effective`），余额不变不会把旧的 `+100` 冲掉；
+  - 变化值与时间随账号落盘（`lastCreditsDelta` / `lastCreditsDeltaAt`），重启后仍能看到最近一次变化。
+
+**验证**：新增 `tests/_test_account_checkin_status.py`（19 条：今日判定、public 字段、+100/-100/不变三种变化、落盘回读、面板渲染与样式）；全量 **66 suites / 1870 checks / 0 failed**。
+
+## v1.6.10
+
+**🐛 问题修复**
+
+- **启动 bat 无法处理带空格的路径**（#85）：`Start-Process -ArgumentList '%SCRIPT%','--port',...` 的每个元素**不会自动加引号**，路径里有空格时会被拆成多个参数（`C:\Users\My` / `Project\qoder_proxy.py` …），python 直接报找不到文件。
+  现在：
+  - 用 `[char]34` 拼出双引号（避开 bat / PowerShell 双重转义），脚本与 pid 路径都作为**单个带引号参数**传入；
+  - 路径经环境变量（`$env:QD_SCRIPT` 等）传入，避开 `&`、`^` 这类 cmd 元字符；
+  - 日志重定向同样用变量，空格路径不再出错；
+  - `-WindowStyle Hidden` / `-PassThru` / `--pid-file` 语义不变（#50 行为不变）。
+
+  实测：在 `...\my project\qoder proxy\` 这种双层空格目录下启动，桩脚本收到的 argv 为 `['…\qoder proxy\qoder_proxy.py', '--port', '18766', '--pid-file', '…\qoder-proxy.pid']`，参数完整未拆分。
+
+**验证**：新增 `tests/_test_issue85_bat_spaces.py`（9 条：源码守卫 + ASCII-only + 真实带空格目录端到端）；全量 **65 suites / 1851 checks / 0 failed**。
+
 ## v1.6.9
 
 **🐛 问题修复（国际版签到不可用 + 无提示）**

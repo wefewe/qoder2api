@@ -61,7 +61,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.6.13"
+VERSION = "1.7.1"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -1819,6 +1819,224 @@ def _usage_daily_uncached(days, group, realm, since):
     }
 
 
+
+# ---------------------------------------------------------------------------
+# 统计概览（新版数据看板）：一次扫描产出 KPI / Top 榜 / 热力图 / 缓存 / 24h 曲线
+# ---------------------------------------------------------------------------
+# compute_usage_stats 的形参名是 range（与 /usage/* 的查询参数同名），
+# 会遮蔽内建 range —— 在模块层先留一个别名，函数内一律用它。
+_RNG = range
+
+_PROVIDER_RULES = (
+    ("claude", "Anthropic"), ("anthropic", "Anthropic"), ("haiku", "Anthropic"),
+    ("sonnet", "Anthropic"), ("opus", "Anthropic"),
+    ("gpt", "OpenAI"), ("openai", "OpenAI"), ("o1", "OpenAI"), ("o3", "OpenAI"),
+    ("o4", "OpenAI"), ("davinci", "OpenAI"),
+    ("gemini", "Google"), ("gemma", "Google"), ("palm", "Google"),
+    ("qwen", "通义千问"), ("qwq", "通义千问"), ("tongyi", "通义千问"),
+    ("deepseek", "DeepSeek"), ("dfmodel", "DeepSeek"), ("df-", "DeepSeek"),
+    ("glm", "智谱 GLM"), ("chatglm", "智谱 GLM"),
+    ("kimi", "月之暗面"), ("moonshot", "月之暗面"),
+    ("llama", "Meta"), ("mistral", "Mistral"), ("mixtral", "Mistral"),
+    ("grok", "xAI"), ("doubao", "豆包"), ("ernie", "文心一言"), ("spark", "讯飞星火"),
+    ("hunyuan", "腾讯混元"), ("minimax", "MiniMax"), ("abab", "MiniMax"),
+)
+
+
+def provider_of(model):
+    """模型 -> 上游厂商（面板「提供商」维度用；未知归「其他」）。"""
+    m = str(model or "").lower()
+    for key, name in _PROVIDER_RULES:
+        if key in m:
+            return name
+    return "其他"
+
+
+def _day_key(ts):
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(float(ts)))
+    except Exception:
+        return ""
+
+
+def compute_usage_stats(range=None, since=None, until=None,
+                        heatmap_days=365, top_n=5):
+    """统计概览页所需的全部数据（单次扫描 usage.jsonl）。
+
+    窗口语义与 /usage/analytics 一致（range_window）：today/week/month/custom/空=全部。
+    热力图固定看最近 heatmap_days 个本地自然日，与窗口无关；窗口只影响 KPI/Top/趋势。
+    """
+    now = time.time()
+    lo, hi = range_window(range, since, until)
+    today_start = _local_midnight()
+    heat_lo = _local_midnight(days_back=max(1, int(heatmap_days)) - 1)
+
+    tot = {"requests": 0, "errors": 0, "tokens": 0,
+           "prompt": 0, "completion": 0, "cached": 0}
+    models = {}       # model -> {"tokens","requests"}
+    accounts = {}     # account -> {"tokens","requests"}
+    providers = {}    # provider -> {"tokens","requests"}
+    heat = {}         # "YYYY-MM-DD" -> tokens
+    act_days = set()  # 窗口内活跃日（本地日期）
+    all_days = set()  # 全年活跃日（连续性计算用）
+    cache_win = {"10m": [0, 0], "1h": [0, 0], "24h": [0, 0], "7d": [0, 0]}
+    hour_cached = [0] * 24
+    hour_prompt = [0] * 24
+    hour_tokens = [0] * 24
+
+    def _bump(bucket, key, tokens, reqs=1):
+        cell = bucket.get(key)
+        if cell is None:
+            cell = bucket[key] = {"tokens": 0, "requests": 0}
+        cell["tokens"] += tokens
+        cell["requests"] += reqs
+
+    if os.path.exists(USAGE_LOG):
+        try:
+            with open(USAGE_LOG, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    at = r.get("at") or 0
+                    try:
+                        at = float(at)
+                    except (TypeError, ValueError):
+                        at = 0.0
+                    prompt = int(r.get("prompt_tokens") or 0)
+                    cached = int(r.get("cached_tokens") or 0)
+                    tokens = int(r.get("total_tokens") or 0)
+                    is_err = bool(r.get("error"))
+                    dkey = _day_key(at)
+                    # 热力图与活跃日：全年范围（不按窗口过滤）
+                    if at >= heat_lo and dkey:
+                        if not is_err and tokens:
+                            heat[dkey] = heat.get(dkey, 0) + tokens
+                        all_days.add(dkey)
+                    # 缓存三窗口：按「现在」回溯（与窗口无关）
+                    if not is_err and prompt > 0:
+                        for _k, _secs in (("10m", 600), ("1h", 3600),
+                                          ("24h", 86400), ("7d", 604800)):
+                            if at >= now - _secs:
+                                cache_win[_k][0] += cached
+                                cache_win[_k][1] += prompt
+                    # 24 小时曲线：按本地整点
+                    if at >= now - 86400 and not is_err:
+                        hour = time.localtime(at).tm_hour
+                        hour_cached[hour] += cached
+                        hour_prompt[hour] += prompt
+                        hour_tokens[hour] += tokens
+                    if not _row_in_window(r, lo, hi):
+                        continue
+                    if dkey:
+                        act_days.add(dkey)
+                    if is_err:
+                        tot["errors"] += 1
+                        continue
+                    tot["requests"] += 1
+                    tot["tokens"] += tokens
+                    tot["prompt"] += prompt
+                    tot["completion"] += int(r.get("completion_tokens") or 0)
+                    tot["cached"] += cached
+                    m = r.get("model") or "(unknown)"
+                    _bump(models, m, tokens)
+                    _bump(accounts, r.get("account") or "(unattributed)", tokens)
+                    _bump(providers, provider_of(m), tokens)
+        except Exception as exc:
+            log("compute_usage_stats failed: %s" % exc, level="WARN", tag="usage")
+
+    _nick = {}
+    try:
+        if POOL:
+            for _a in POOL.accounts:
+                _nick[_a.uid] = _a.nickname or _a.uid[:8]
+    except Exception:
+        _nick = {}
+
+    def _rank(bucket, limit=None):
+        rows = sorted(bucket.items(), key=lambda kv: kv[1]["tokens"], reverse=True)
+        if limit:
+            rows = rows[:limit]
+        total = sum(v["tokens"] for _, v in rows) or 1
+        return [{"name": _nick.get(k) or k, "key": k, "tokens": v["tokens"], "requests": v["requests"],
+                 "share": round(v["tokens"] * 100.0 / total, 2)}
+                for k, v in rows]
+
+    # 连续天数：从今天（或昨天）往回数全年活跃日
+    streak = 0
+    if all_days:
+        probe = time.localtime()
+        # 今天没有请求时从昨天开始数（今天还没过完，不该中断）
+        if _day_key(now) not in all_days:
+            probe = time.localtime(now - 86400)
+        while True:
+            d = time.strftime("%Y-%m-%d", probe)
+            if d not in all_days:
+                break
+            streak += 1
+            probe = time.localtime(time.mktime(probe[:3] + (0, 0, 0, 0, 0, -1)) - 86400)
+
+    top_models = _rank(models)
+    hours = []
+    for i in _RNG(23, -1, -1):
+        ts = now - i * 3600
+        h = time.localtime(ts).tm_hour
+        prompt = hour_prompt[h]
+        cached = hour_cached[h]
+        hours.append({
+            "ts": int(ts),
+            "label": time.strftime("%H:00", time.localtime(ts)),
+            "pct": (round(cached * 100.0 / prompt, 2) if prompt else None),
+            "tokens": hour_tokens[h],
+        })
+
+    cache_rows = []
+    for _k, _label in (("10m", "近 10 分钟"), ("1h", "近 1 小时"),
+                       ("24h", "近 24 小时"), ("7d", "近 7 天")):
+        hit, inp = cache_win[_k]
+        cache_rows.append({"key": _k, "label": _label, "hit": hit, "input": inp,
+                           "pct": (round(hit * 100.0 / inp, 1) if inp else None)})
+
+    heat_days = []
+    start = time.localtime(heat_lo)
+    cursor = time.mktime((start.tm_year, start.tm_mon, start.tm_mday,
+                          0, 0, 0, 0, 0, -1))
+    while cursor <= now:
+        d = _day_key(cursor)
+        heat_days.append({"date": d, "tokens": heat.get(d, 0)})
+        cursor += 86400
+
+    return {
+        "window": {"from": lo, "to": hi, "range": str(range or "all")},
+        "kpi": {
+            "requests": tot["requests"],
+            "success": tot["requests"],
+            "errors": tot["errors"],
+            "success_pct": (round(tot["requests"] * 100.0 /
+                                  (tot["requests"] + tot["errors"]), 2)
+                            if (tot["requests"] + tot["errors"]) else None),
+            "tokens": tot["tokens"],
+            "prompt": tot["prompt"],
+            "completion": tot["completion"],
+            "cached": tot["cached"],
+            "active_days": len(act_days),
+            "streak_days": streak,
+            "top_model": (top_models[0] if top_models else None),
+        },
+        "top_accounts": _rank(accounts, top_n),
+        "top_providers": _rank(providers, top_n),
+        "models": _rank(models, 10),
+        "providers": _rank(providers, 10),
+        "cache": {"windows": cache_rows},
+        "hourly": {"points": hours},
+        "heatmap": {"days": heat_days,
+                     "max": max([d["tokens"] for d in heat_days] or [0])},
+    }
+
 def compute_usage_analytics(range=None, since=None, until=None):
     """Detailed analytics for Token, Cache, and Reasoning metrics page.
 
@@ -3167,6 +3385,50 @@ def apply_update_now(tag=None):
     """执行更新（阻塞）；成功后调用方负责触发重启。"""
     with _UPDATE_LOCK:
         return qoder_updater.apply_update(APP_ROOT, tag=tag)
+
+# 进程级启动时间：/health 回给外部（issue #89：判断「跑的是不是新版本」）
+STARTED_AT = time.time()
+
+
+def _pid_alive(pid):
+    """PID 是否还活着（跨平台；权限不足视为活着）。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+
+def classify_existing_instance(existing, pid_alive=None):
+    """判断 /health 的应答者属于哪种情况（issue #89）。
+
+    返回 "foreign" / "healthy" / "stale" / "none"：
+      · foreign  —— 同端口上是别的服务（service 字段不对或没有 accounts）
+      · healthy  —— 真的是一个活着的 qd-proxy
+      · stale    —— 应答来自**正在退出**的旧实例（pid 已不存在），不该拦启动
+      · none     —— 没人应答
+    """
+    if not isinstance(existing, dict):
+        return "none"
+    if existing.get("service") not in (None, "qoder-proxy") \
+            or "accounts" not in existing:
+        return "foreign"
+    alive = pid_alive or _pid_alive
+    pid = existing.get("pid")
+    if pid and not alive(pid):
+        return "stale"
+    return "healthy"
+
 
 # ---------------------------------------------------------------------------
 # 项目新版本检测（对比 GitHub 最新 release；结果缓存 6 小时）
@@ -6065,15 +6327,31 @@ def _team_min_gap():
 
 
 def _is_team_account(account):
-    """团队/企业账号判定：userType 或额度快照里有组织共享池（issue #56）。"""
+    """团队/企业账号判定（issue #56 / #90）。
+
+    口径与 Account.is_team() 同源：组织字段（OAuth 登录即带）> userType > 共享额度池。
+    issue #90 起因：userinfo 根本不返回 user_type，企业号只靠 userType 判定会漏，
+    结果团队闸门/共享额度都不生效。
+    """
     if account is None:
         return False
+    probe = getattr(account, "is_team", None)
+    if callable(probe):
+        try:
+            return bool(probe())
+        except Exception:
+            pass
     ut = str(getattr(account, "user_type", "") or "").lower()
     if "team" in ut or "enterprise" in ut:
         return True
+    if str(getattr(account, "organization_id", "") or "").strip() \
+            or str(getattr(account, "organization_name", "") or "").strip():
+        return True
     cred = getattr(account, "credits", None)
     if isinstance(cred, dict):
-        if isinstance(cred.get("shared"), dict) and cred["shared"].get("size"):
+        shared = cred.get("shared")
+        if isinstance(shared, dict) and (shared.get("size")
+                                        or shared.get("unlimited")):
             return True
         for pkg in cred.get("packages") or []:
             if isinstance(pkg, dict) and pkg.get("name") == "共享额度":
@@ -8541,6 +8819,10 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "service": "qoder-proxy",
                 "version": VERSION,
+                "pid": os.getpid(),
+                "started_at": int(STARTED_AT),
+                "started_iso": time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.localtime(STARTED_AT)),
                 "realm": CURRENT_REALM,
                 "accounts": len(POOL.accounts) if POOL else 0,
                 "accounts_ready": POOL.count_ready() if POOL else 0,
@@ -8852,6 +9134,13 @@ class Handler(BaseHTTPRequestHandler):
             # 输出与改动前逐字节一致；语义见 range_window）
             req_range, req_since, req_until = range_query(query)
             return self._json(200, compute_usage_analytics(
+                range=req_range, since=req_since, until=req_until))
+        if path == "/usage/stats":
+            # 统计概览（新版数据看板）：KPI / Top 榜 / 热力图 / 缓存 / 24h 曲线一次取回
+            if not self._authorized():
+                return
+            req_range, req_since, req_until = range_query(query)
+            return self._json(200, compute_usage_stats(
                 range=req_range, since=req_since, until=req_until))
         if path == "/usage/by-account":
             if not self._authorized():
@@ -10713,43 +11002,62 @@ def main():
 
     # 拒绝启动第二份：Windows 上 SO_REUSEADDR 会让两个 socket 绑同一端口，
     # 连接被静默分流，极难诊断。
-    try:
-        probe = urllib.request.urlopen(
-            "http://%s:%d/health"
-            % ("127.0.0.1" if args.host == "0.0.0.0" else args.host, args.port),
-            timeout=2)
-        existing = json.loads(probe.read().decode("utf-8"))
-    except Exception:
-        existing = None   # 没人应答 /health —— 让下面的 bind 决定
-    if isinstance(existing, dict):
-        # 只有我们的 /health 带账号池字段（"accounts"）。其它服务可能占用
-        # 同端口也应答 /health JSON（例如 wb-proxy / mimo-api-proxy）。
-        foreign = existing.get("service") not in (None, "qoder-proxy") \
-            or "accounts" not in existing
-        if foreign:
-            who = existing.get("service") or "an unknown HTTP service"
-            print()
-            print("  [ERROR] port %d is already taken by another program: %s"
-                  % (args.port, who))
-            print("          qd-proxy itself is NOT running - nothing was "
-                  "started.")
-            print()
-            print("  Fix: start qoder-proxy on a different port, e.g.")
-            print("          %s %d" % (START_SCRIPT, args.port + 1))
-            print("          python qoder_proxy.py --port %d" % (args.port + 1))
-            print()
-            for cmd in port_owner_hint(args.port):
-                print("  Check who owns the port:  %s" % cmd)
-            print()
-            raise SystemExit(1)
+    #
+    # issue #89：只问「有没有人应答 /health」会把「刚收到 SIGTERM、还在收尾的旧
+    # 实例」误判成健康双开——升级（kill 后立刻 start）时几乎必撞。现在按 应答者
+    # 的 pid 是否还活着 分类，并对「端口尚未释放」做有限重试。
+    def _probe_health(timeout=2.0):
+        try:
+            url = "http://%s:%d/health" % (
+                "127.0.0.1" if args.host == "0.0.0.0" else args.host,
+                args.port)
+            with urllib.request.urlopen(url, timeout=timeout) as probe:
+                return json.loads(probe.read().decode("utf-8"))
+        except Exception:
+            return None
+
+    existing = None
+    for _attempt in range(3):
+        existing = _probe_health()
+        if classify_existing_instance(existing) != "stale":
+            break
+        print()
+        print("  [WARN] %d 端口仍有人在应答 /health，但它的进程已经退出"
+              % args.port)
+        print("         （旧实例正在释放端口）。继续启动新实例：等待 %d/3 ..."
+              % (_attempt + 1))
+        sys.stdout.flush()
+        time.sleep(1.2)
+        existing = None
+    _kind = classify_existing_instance(existing)
+    if _kind == "foreign":
+        who = (existing or {}).get("service") or "an unknown HTTP service"
+        print()
+        print("  [ERROR] port %d is already taken by another program: %s"
+              % (args.port, who))
+        print("          qd-proxy itself is NOT running - nothing was "
+              "started.")
+        print()
+        print("  Fix: start qoder-proxy on a different port, e.g.")
+        print("          %s %d" % (START_SCRIPT, args.port + 1))
+        print("          python qoder_proxy.py --port %d" % (args.port + 1))
+        print()
+        for cmd in port_owner_hint(args.port):
+            print("  Check who owns the port:  %s" % cmd)
+        print()
+        raise SystemExit(1)
+    if _kind == "healthy":
         print()
         print("  [已有一个反代在 %d 端口运行，无需重复启动]" % args.port)
+        print("  PID: %s · 版本: %s · 启动于: %s"
+              % (existing.get("pid") or "?", existing.get("version") or "?",
+                 existing.get("started_iso") or "?"))
         print("  账号: %s @ %s" % (existing.get("uid", "?"),
                                    existing.get("domain", "?")))
         print("  看板: http://127.0.0.1:%d/" % args.port)
         print()
-        print("  如果要重启: 先把原来那个窗口关掉（或结束 python 进程），"
-              "再运行本程序。")
+        print("  如果要重启: 用 stop 脚本（Windows: stop-qoder-proxy.bat /"
+              " Linux·macOS: ./stop-qoder-proxy.sh），再启动本程序。")
         print()
         return
 
@@ -10922,23 +11230,41 @@ def main():
         print()
         sys.stdout.flush()
 
-    try:
-        server = ThreadingHTTPServer((args.host, args.port), Handler)
-    except OSError as exc:
-        # bind 前探测与 bind 之间端口被抢，或被不答 /health 的程序占着
-        print()
-        print("  [ERROR] failed to listen on %s:%d - %s"
-              % (args.host, args.port, exc))
-        print("          the port is reserved or held by another program;")
-        print("          qd-proxy did NOT start.")
-        print()
-        print("  Fix: stop the program holding the port, or pick another "
-              "port:")
-        for cmd in port_owner_hint(args.port):
-            print("          %s" % cmd)
-        print("          %s %d" % (START_SCRIPT, args.port + 1))
-        print()
-        raise SystemExit(1)
+    # issue #89：旧实例刚退出时端口可能还没释放——有限重试，并在此期间复查
+    # /health：如果是**健康**实例起来了，就按「已在运行」退出而不是报错。
+    server = None
+    for _attempt in range(3):
+        try:
+            server = ThreadingHTTPServer((args.host, args.port), Handler)
+            break
+        except OSError as exc:
+            _kind2 = classify_existing_instance(_probe_health(1.0))
+            if _kind2 == "healthy":
+                print()
+                print("  [已有一个反代在 %d 端口运行，无需重复启动]" % args.port)
+                print("  看板: http://127.0.0.1:%d/" % args.port)
+                print()
+                return
+            if _attempt < 2:
+                print("  [WARN] bind %s:%d 失败（%s）——端口可能仍在释放，"
+                      "重试 %d/3 ..." % (args.host, args.port, exc, _attempt + 1))
+                sys.stdout.flush()
+                time.sleep(1.5)
+                continue
+            print()
+            print("  [ERROR] failed to listen on %s:%d - %s"
+                  % (args.host, args.port, exc))
+            print("          the port is reserved or held by another program")
+            print("          (possibly a qd-proxy instance that is still shutting down);")
+            print("          qd-proxy did NOT start.")
+            print()
+            print("  Fix: wait a second and retry, stop the program holding the")
+            print("       port, or pick another port:")
+            for cmd in port_owner_hint(args.port):
+                print("          %s" % cmd)
+            print("          %s %d" % (START_SCRIPT, args.port + 1))
+            print()
+            raise SystemExit(1)
     log("listening  : http://%s:%d/v1  (api key: %s)"
         % (args.host, args.port, "on" if API_KEY else "off"))
     log("dashboard  : http://%s:%d/" % (args.host, args.port))

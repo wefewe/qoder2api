@@ -2,23 +2,27 @@
 
 每个版本的发布说明同步在 [GitHub Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
 
-## v1.7.11
-
-**🐛 问题修复：官方改模型显示名后被静默按 auto 计费（Kimi-K3.1-Pro 实测）**
-
-- **根因一（计费归因）**：官方 CLI 的请求体 `business` 块带 `model_key`，上游计费归因读它；网关此前只发 `{id/name/begin_at/product/type/stage}`，`kmodel_latest` 这类模型被 qoder 后台静默记成 **auto**（老模型疑似有 model_config 兜底不受影响——这正是「只有某个模型计费异常」的报告形状）。现在 `build_qoder_body` 始终带上 `model_key`，`business.version` 也从模板残留的 `0.1.43` 对齐为与 `cosy-version` 同源。
-- **根因二（名字解析）**：官方把 `kmodel_latest` 显示名从 Kimi-K3 改为 Kimi-K3.1-Pro 后，`/v1/models`（动态清单）广告新名、解析器只认冻结快照（旧名）——客户端用新名请求时**显示名被原样当上游 key** 发出。新增**动态显示名索引**：动态清单一到手就把「display_name -> key」注册进 `resolve_upstream_key`（别名 -> 冻结显示名 -> 动态显示名的解析顺序），并补 `kimi-k3.1-pro` 别名做离线兜底；BYOK 自定义模型的透传语义不变。
-- **请求路径安全（#86 语义保持）**：解析失败的惰性补拉与 `catalog_meta_for` 的元数据查询只读**离线源**（`fetch_models(allow_network=False)`：内存缓存 → issue #58 落盘缓存 → 本机目录缓存 → 快照），不出网、不触发 `POOL.pick` 轮换账号，离线结果带 60s memo 防止降级环境每请求重复读盘；启动时后台线程预热一次动态清单，`/models/refresh` 同步注册新显示名。Anthropic 入口同样换用新解析器（否则改名窗口期思考档位会被静默丢弃一轮）。
-- **catalog-v7**：官方客户端 1.1.81 起模型目录缓存写 `catalog-v7`（与 v6 同为 QMC v1 加密）；`read_local_models` 与 `_refresh_catalog.py` 现在 v7 优先、v6 兜底。
-
-**验证**：新增 `tests/_test_live_model_names.py`(29，含「离线绝不出网」不变量)、`tests/_test_business_model_key.py`(14)；全量 **91 suites / 2485 checks / 0 failed**。线上证据链：官方 CLI（npm 包）挂 undici 诊断通道钩子抓取完整请求（zstd + qoder_encode 解码）逐字段对比，单变量补 `business.model_key` 后 qoder 后台立即按 kimi-k3.1-pro 计费。
-
 ## 版本号规则
 
 - 每次发布**照常递增补丁号**：1.6.0 → 1.6.1 → 1.6.2 …
 - 补丁号累计到 **14** 之后，下一次发布升**次版本**并把补丁号归零：
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
+
+
+## v1.7.12
+
+**🐛 问题修复**
+
+- **chat 流式出口吞掉同帧 tool_calls 起点，下游整轮失败**（#124）：回读/暂存路径合成「正文帧」时只带 `content`，把**同一帧里的** `tool_calls`（含 `function.name`）整帧丢掉 —— 下游只收到后续参数帧，index 上永远没有 name，ai-sdk 系客户端收尾时抛 `OpenAI Chat tool call delta is missing id or name`，整轮作废（报错位置还是误导性的收尾帧）。
+  新增 `_carry_delta()` / `_content_chunk()`：改写正文时把 `tool_calls` / `reasoning_content` 原样搬运到合成帧；**带 finish_reason 的分支不重复携带**（那些分支的收尾帧已含原始增量，否则同一调用会发两次、参数翻倍成 `name="editedit"`）。
+- **出口再加一层「无名调用扣住」**（#124 建议 3，与 #116 同构）：`_sse_guard_nameless_tool_calls()` 插在 `fill_ids` 之后、截断守卫之前 ——
+  - 该 index 的 name 未到 → 扣住 arguments，不发帧（正文/思考照发）；
+  - name 到 → 立刻发「id + name + 攒下的 arguments」一次；
+  - 流结束仍无名 → 丢弃，并把 `finish_reason: tool_calls` 降级为 `stop`（下游不会一直等工具结果），同时打 WARN + `RECOVERY_STATS.nameless_drop`。
+- **CHANGELOG 重复的 `## v1.7.11`**（#124 附注）：合并社区 PR #119 时把新节插到了文件头，导致「版本号规则」被夹在两个同名标题之间。已合并为一节，并把「版本号规则」放回顶部。
+
+**验证**：新增 `tests/_test_issue124_nameless_tool_call.py`（16 条：同帧 content+起点、content+reasoning+起点、孤儿无名调用扣住并降级、name 后到合并成一帧、正常并行双调用不变、纯正文流内容/帧数不变、content+调用+fin 不重复）；全量 **98 suites / 2587 checks / 0 failed**。
 
 ## v1.7.11
 
@@ -43,6 +47,15 @@
 - **README**（#122）：补充姊妹项目链接。
 
 **验证**：新增 `_test_issue116_anthropic_tool_name`(15)、`_test_issue123_sbc_vm`(9)、`_test_issue123_checkin_diag`(10)，加上合并 PR 自带的 `_test_business_model_key`(14)、`_test_live_model_names`(29)、`_test_issue112_truncated_stream`(11)、`_test_issue120_unrecovered_dsml`(19)、`_test_issue120c_residue_edges`(8)；全量 **97 suites / 2571 checks / 0 failed**。
+
+### 计费归因细节（#119 根因，来自社区 PR）
+
+**🐛 问题修复：官方改模型显示名后被静默按 auto 计费（Kimi-K3.1-Pro 实测）**
+- **根因一（计费归因）**：官方 CLI 的请求体 `business` 块带 `model_key`，上游计费归因读它；网关此前只发 `{id/name/begin_at/product/type/stage}`，`kmodel_latest` 这类模型被 qoder 后台静默记成 **auto**（老模型疑似有 model_config 兜底不受影响——这正是「只有某个模型计费异常」的报告形状）。现在 `build_qoder_body` 始终带上 `model_key`，`business.version` 也从模板残留的 `0.1.43` 对齐为与 `cosy-version` 同源。
+- **根因二（名字解析）**：官方把 `kmodel_latest` 显示名从 Kimi-K3 改为 Kimi-K3.1-Pro 后，`/v1/models`（动态清单）广告新名、解析器只认冻结快照（旧名）——客户端用新名请求时**显示名被原样当上游 key** 发出。新增**动态显示名索引**：动态清单一到手就把「display_name -> key」注册进 `resolve_upstream_key`（别名 -> 冻结显示名 -> 动态显示名的解析顺序），并补 `kimi-k3.1-pro` 别名做离线兜底；BYOK 自定义模型的透传语义不变。
+- **请求路径安全（#86 语义保持）**：解析失败的惰性补拉与 `catalog_meta_for` 的元数据查询只读**离线源**（`fetch_models(allow_network=False)`：内存缓存 → issue #58 落盘缓存 → 本机目录缓存 → 快照），不出网、不触发 `POOL.pick` 轮换账号，离线结果带 60s memo 防止降级环境每请求重复读盘；启动时后台线程预热一次动态清单，`/models/refresh` 同步注册新显示名。Anthropic 入口同样换用新解析器（否则改名窗口期思考档位会被静默丢弃一轮）。
+- **catalog-v7**：官方客户端 1.1.81 起模型目录缓存写 `catalog-v7`（与 v6 同为 QMC v1 加密）；`read_local_models` 与 `_refresh_catalog.py` 现在 v7 优先、v6 兜底。
+**验证**：新增 `tests/_test_live_model_names.py`(29，含「离线绝不出网」不变量)、`tests/_test_business_model_key.py`(14)；全量 **91 suites / 2485 checks / 0 failed**。线上证据链：官方 CLI（npm 包）挂 undici 诊断通道钩子抓取完整请求（zstd + qoder_encode 解码）逐字段对比，单变量补 `business.model_key` 后 qoder 后台立即按 kimi-k3.1-pro 计费。
 
 ## v1.7.10
 

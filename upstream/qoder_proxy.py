@@ -64,7 +64,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.11"
+VERSION = "1.7.12"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4869,6 +4869,34 @@ def _echo_hold_candidate(text):
     return _still_leak_candidate(text) or _tool_echo_prefix_hold(text)
 
 
+def _carry_delta(delta):
+    """取一帧里「除 content 外的增量」（tool_calls / reasoning_content）。
+
+    issue #124：合成正文帧时只带 content，会把**同一帧里的** tool_calls 起点
+    （带 function.name）整个丢掉 —— 下游只收到后续参数帧，index 上永远没有
+    name，ai-sdk 系客户端收尾时抛 "tool call delta is missing id or name"。
+    正文要被改写时，这两类增量必须原样搬运到合成帧里。
+    """
+    if not isinstance(delta, dict):
+        return {}
+    out = {}
+    tcs = delta.get("tool_calls")
+    if isinstance(tcs, list) and tcs:
+        out["tool_calls"] = tcs
+    rc = delta.get("reasoning_content")
+    if isinstance(rc, str) and rc:
+        out["reasoning_content"] = rc
+    return out
+
+
+def _content_chunk(meta, piece, delta=None, finish_reason=None):
+    """正文帧 = content + 该帧原有的 tool_calls/reasoning 增量（issue #124）。"""
+    body = {"content": piece}
+    body.update(_carry_delta(delta))
+    return _leak_chunk_frame(meta, body, finish_reason)
+
+
+
 def _leak_chunk_frame(meta, delta, finish_reason=None):
     """按流式 chat.completion.chunk 形态合成一帧（沿用上游的 id/model）。"""
     payload = {
@@ -5043,7 +5071,7 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
         if piece_raw is not None and not isinstance(piece_raw, str):
             # 非字符串 content（罕见）：不参与暂存判断，原样透传
             if hold is not None:
-                yield _leak_chunk_frame(meta, {"content": hold})
+                yield _content_chunk(meta, hold)   # 随后 yield raw 已携带增量
                 hold = None
                 hold_frames = 0
             yield raw
@@ -5075,7 +5103,7 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                     log("released oversized leak hold (%d chars / %d frames) "
                         "— fail-open" % (len(hold), hold_frames),
                         level="WARN", tag="chat")
-                    yield _leak_chunk_frame(meta, {"content": hold})
+                    yield _content_chunk(meta, hold, None if fin else delta)
                     hold = None
                     hold_frames = 0
                     if fin:
@@ -5109,7 +5137,7 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                 if _still_leak_candidate(_tail60):
                     _prose60 = hold[:_last_m.start()]
                     if _prose60.strip():
-                        yield _leak_chunk_frame(meta, {"content": _prose60})
+                        yield _content_chunk(meta, _prose60, None if fin else delta)
                     hold = _tail60
                     if fin:
                         finished = (_frame_without_content(payload), fin)
@@ -5138,7 +5166,7 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                 raise EmptyToolEcho(len(hold), "unrecovered_falsified")
             else:
                 # 证伪：暂存整段补发为普通正文
-                yield _leak_chunk_frame(meta, {"content": hold})
+                yield _content_chunk(meta, hold, None if fin else delta)
             hold = None
             hold_frames = 0
             if fin:
@@ -5157,7 +5185,7 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             _emit16, _hold16 = _find_marker_split(piece)
             if _hold16:
                 if _emit16:
-                    yield _leak_chunk_frame(meta, {"content": _emit16})
+                    yield _content_chunk(meta, _emit16, None if fin else delta)
                 hold = _hold16
                 hold_frames = 1
                 if fin:
@@ -5173,10 +5201,9 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                     # 去掉 content，否则同一段内容会被发两次（issue #16）。
                     finished = (_frame_without_content(payload), fin)
                 continue
-            if fin:
-                yield _leak_chunk_frame(meta, {"content": piece}, fin)
-            else:
-                yield _leak_chunk_frame(meta, {"content": piece})
+            # issue #124：同帧里可能还有 tool_calls 起点（带 name）——
+            # 只发 content 会把起点整帧吞掉，下游 index 永远缺 name。
+            yield _content_chunk(meta, piece, delta, fin)
             continue
         yield raw
 
@@ -5250,7 +5277,7 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                     level="WARN", tag="chat")
                 raise EmptyToolEcho(len(hold), "unrecovered_leak")
             else:
-                yield _leak_chunk_frame(meta, {"content": hold})
+                yield _content_chunk(meta, hold)   # 流末补发：不再重复增量
     if finished is not None:
         payload, fin = finished
         if recovered:
@@ -5470,6 +5497,126 @@ def _sse_guard_truncated_tool_args(frames):
             raise EmptyToolEcho(len(args), "truncated_arguments")
 
 
+def _finish_only_frame(payload, finish_reason):
+    """复制一帧、清空 delta、只改 finish_reason（issue #124 降级用）。"""
+    out = dict(payload or {})
+    choices = []
+    for ch in (payload or {}).get("choices") or []:
+        if isinstance(ch, dict):
+            ch2 = dict(ch)
+            ch2["delta"] = {}
+            ch2["finish_reason"] = finish_reason
+            choices.append(ch2)
+        else:
+            choices.append(ch)
+    if not choices:
+        choices = [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+    out["choices"] = choices
+    return ("data: " + json.dumps(out, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
+def _sse_guard_nameless_tool_calls(frames):
+    """issue #124：没拿到 name 的 tool_call 起点不许直接发给下游。
+
+    上游（或回读路径）可能先给「index + arguments」、name 稍后才到，甚至永不到。
+    OpenAI 流式语义里一个 index 的首帧必须同时带 id 与 name；ai-sdk 这类客户端
+    会把它挂进 pendingTools，收尾仍不完整就抛
+    "OpenAI Chat tool call delta is missing id or name"，整轮作废。
+
+    与 Anthropic 侧的 #116 同构：
+      · name 未到 -> 扣住 arguments，不发这一条；
+      · name 到 -> 立刻发「id + name + 攒下的 arguments」一次；
+      · 流结束仍无名 -> 丢弃，并把 finish_reason: tool_calls 降级为 stop。
+    """
+    pending = {}
+
+    for raw in frames:
+        text = (raw.decode("utf-8", "replace")
+                if isinstance(raw, bytes) else raw)
+        data = strip_data_prefix(text)
+        payload = None
+        if data and data != "[DONE]":
+            try:
+                payload = json.loads(data)
+            except Exception:
+                payload = None
+        if not isinstance(payload, dict):
+            yield raw
+            continue
+        choices = payload.get("choices") or []
+        choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+        delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+        fin = choice.get("finish_reason")
+        tcs = delta.get("tool_calls")
+        if not isinstance(tcs, list) or not tcs:
+            if fin and any(not s["opened"] for s in pending.values()):
+                yield _finish_only_frame(payload, "stop")
+            else:
+                yield raw
+            continue
+
+        forwarded = []
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            idx = tc.get("index")
+            idx = idx if isinstance(idx, int) else 0
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            name = str(fn.get("name") or "")
+            args = fn.get("arguments") or ""
+            slot = pending.setdefault(idx, {"id": "", "type": tc.get("type"),
+                                            "name": "", "args": [], "opened": False})
+            if tc.get("id"):
+                slot["id"] = str(tc["id"])
+            if name:
+                slot["name"] = name
+            if not slot["name"]:
+                slot["args"].append(args)        # 扣住，等 name
+                continue
+            if not slot["opened"]:
+                slot["opened"] = True
+                forwarded.append({
+                    "index": idx,
+                    "id": slot["id"] or _new_id("call_"),
+                    "type": slot["type"] or "function",
+                    "function": {"name": slot["name"],
+                                 "arguments": "".join(slot["args"]) + args},
+                })
+                slot["args"] = []
+            else:
+                forwarded.append({
+                    "index": idx,
+                    "id": slot["id"] or "",
+                    "type": slot["type"] or "function",
+                    "function": {"arguments": args},
+                })
+
+        body = {k: v for k, v in delta.items() if k != "tool_calls"}
+        if forwarded:
+            body["tool_calls"] = forwarded
+            frame = dict(payload)
+            frame["choices"] = [{"index": choice.get("index", 0) or 0,
+                                 "delta": body, "finish_reason": fin}]
+            yield ("data: " + json.dumps(frame, ensure_ascii=False)
+                   + "\n\n").encode("utf-8")
+        elif body:
+            # 这一帧还有正文/思考：只把无名 tool_calls 剥掉，其余照发
+            frame = dict(payload)
+            frame["choices"] = [{"index": choice.get("index", 0) or 0,
+                                 "delta": body, "finish_reason": fin}]
+            yield ("data: " + json.dumps(frame, ensure_ascii=False)
+                   + "\n\n").encode("utf-8")
+        elif fin and any(not s["opened"] for s in pending.values()):
+            yield _finish_only_frame(payload, "stop")
+
+    dropped = [i for i, s in pending.items() if not s["opened"]]
+    if dropped:
+        RECOVERY_STATS["nameless_drop"] = RECOVERY_STATS.get("nameless_drop", 0) + 1
+        log("dropped %d tool_call(s) without name at stream end - issue #124"
+            % len(dropped), level="WARN", tag="chat")
+
+
+
 def recover_leaked_tool_calls(frames, allowed_names=None):
     """流式出口：回读（issue #8）+ **tool_call id 保证**（issue #47）
     + 截断参数守卫（issue #112）。
@@ -5477,10 +5624,11 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
     保持同名：三条调用点（chat 主链路 / Anthropic / Responses）都不用改。
     """
     for frame in _sse_guard_truncated_tool_args(
-            _sse_fill_tool_call_ids(
-                _sse_recover_dsml(
-                    _recover_leaked_tool_calls_inner(frames, allowed_names),
-                    allowed_names))):
+            _sse_guard_nameless_tool_calls(
+                _sse_fill_tool_call_ids(
+                    _sse_recover_dsml(
+                        _recover_leaked_tool_calls_inner(frames, allowed_names),
+                        allowed_names)))):
         yield frame
 
 

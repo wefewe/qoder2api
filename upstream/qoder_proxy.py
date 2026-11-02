@@ -28,7 +28,7 @@ OpenAI 兼容接口。上游链路：
 import argparse
 import atexit
 import hashlib
-from collections import deque
+from collections import deque, OrderedDict
 import re
 import json
 import os
@@ -64,7 +64,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.13"
+VERSION = "1.7.18"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2420,10 +2420,12 @@ def prefix_session_cache():
 
 
 def assign_prefix_session(body, account, model_key, client_session_key=None,
-                          usage_ctx=None):
+                          usage_ctx=None, fallback_session_id=None):
     """Choose a cache-affine ID only within the selected upstream account."""
     # Always reset: a preceding failed account may already have acquired an ID.
-    body["session_id"] = str(uuid.uuid4())
+    # issue #128：没有前缀缓存命中时用**会话级** id 兜底，保证同一对话的
+    # session_id 稳定（上游用量归组用），而不是每请求一个新 uuid。
+    body["session_id"] = fallback_session_id or str(uuid.uuid4())
     if usage_ctx is not None:
         usage_ctx["session_affinity"] = "random"
     try:
@@ -6050,7 +6052,22 @@ def _keep_toplevel_images():
     return str(os.environ.get("QD_KEEP_TOPLEVEL_IMAGES") or "").strip().lower()         in ("1", "on", "true", "yes")
 
 
-def build_qoder_body(payload, account, model_key, realm=None):
+def _quota_hint(detail):
+    """上游 detail -> 人话解释（issue #123 后续）。只认已实测过的码。"""
+    d = str(detail or "")
+    if "10605" in d or "isQueued" in d:
+        return ("上游排队中（10605 / RESOURCE_LIMIT）：等 retryAfterSeconds 后会放行，")
+    if "112" in d and ("pricingUrl" in d or "code" in d):
+        return "账号额度耗尽（112 / pricingUrl）：充值或换号，重试无效"
+    if "Billing daily count exceeded" in d or "110" in d:
+        return "当日计费次数上限（110）：次日 0 点重置"
+    if "430" in d:
+        return "客户端/网关版本过低（430）：上游要求升级"
+    if "TOKEN_EXPIRE" in d or "expire" in d.lower():
+        return "凭证过期：需要重新登录该账号"
+    return ""
+
+def build_qoder_body(payload, account, model_key, realm=None, conversation=None):
     """构造 agent_chat_generation 上游请求体（返回 dict，随后 qoder_encode）。
 
     以官方 baseprompt.json 为骨架：每次覆写 request/session id、时间戳、
@@ -6107,7 +6124,10 @@ def build_qoder_body(payload, account, model_key, realm=None):
 
     nid = str(uuid.uuid4())
     body["request_id"] = nid
-    body["chat_record_id"] = nid
+    # issue #128：用量面板的「一条对话」看起来是按 chat_record_id 归组的（官方
+    # 客户端一次对话内该值不变）。同一会话复用会话 id；request_id 仍然每请求
+    # 唯一 —— 计费/限额按请求计数，不能被并掉。
+    body["chat_record_id"] = (conversation or {}).get("id") or nid
     body["request_set_id"] = str(uuid.uuid4())
     body["session_id"] = str(uuid.uuid4())
     body["stream"] = True
@@ -6195,8 +6215,15 @@ def build_qoder_body(payload, account, model_key, realm=None):
 
     # business 会话卡片
     biz = body.get("business") or {}
-    biz["id"] = str(uuid.uuid4())
-    biz["begin_at"] = int(time.time() * 1000)
+    # issue #128：同一次对话复用同一个 id 与 begin_at —— 上游用量面板按它归组，
+    # 每请求一个新 uuid 会把一个 agent 回合拆成几十条「<1min 的对话」，
+    # 日上限（code 110）被迅速刷爆。拿不到会话身份时保持旧行为。
+    if conversation:
+        biz["id"] = conversation["id"]
+        biz["begin_at"] = conversation["begin_at"]
+    else:
+        biz["id"] = str(uuid.uuid4())
+        biz["begin_at"] = int(time.time() * 1000)
     biz["name"] = (prompt[:30] if prompt else "chat")
     biz.setdefault("product", "cli")
     biz.setdefault("type", "agent")
@@ -6314,6 +6341,94 @@ def realm_model_throttled(realm, model):
     if waits and all(w > 0 for w in waits):
         return (True, max(1, int(min(waits))))
     return (False, 0)
+
+
+# ---------------------------------------------------------------------------
+# 上游会话身份（issue #128）
+# ---------------------------------------------------------------------------
+# 官方客户端在一次对话里全程复用同一个 business.id / session_id，因此 Qoder 用量
+# 面板把整段对话算成**一条**；网关此前每个 HTTP 请求都新造 uuid —— 一个 Codex
+# 回合里有几十次工具步进，就被上游记成几十条「<1min 的对话」，日上限（code 110）
+# 很快被刷爆。
+#
+# 策略：同一客户端会话复用同一身份与 begin_at。
+#   1) 客户端显式给了会话键（X-Conversation-Id / session_id / metadata…）就用它；
+#   2) 没给时退化为「首条 user 消息 + 系统提示 + 模型」的摘要 —— Codex 全量回放
+#      历史，首条消息在一次对话里恒定，因此同一对话能稳定命中；
+#   3) 两者都拿不到 -> 保持旧行为（每次新造），绝不把无关请求并成一条。
+# 可用 QD_CONVERSATION_SHARE=0 整体关闭（回到 v1.7.14 行为）。
+CONVERSATION_SHARE = (os.environ.get("QD_CONVERSATION_SHARE") or "1").strip() \
+    not in ("0", "false", "False", "no")
+_CONV_TTL_SECS = float(os.environ.get("QD_CONVERSATION_TTL") or 6 * 3600)
+_CONV_MAX_ENTRIES = 4096
+_CONVERSATIONS = OrderedDict()      # key -> {"id","begin_at","at"}
+_CONV_LOCK = threading.Lock()
+
+
+def _conversation_key_from_history(payload):
+    """会话判据：**最后一条 user 消息** + 系统提示 + 模型（issue #128 后续）。
+
+    为什么不是首条：Codex 全量回放历史，若用首条，整个窗口（可能几小时）永远是
+    同一个 id —— 用量面板里就成了一条超长对话，看不出「这次对话花了多久」。
+    用最后一条 user 消息：同一次对话内（工具步进时）它不变，用户下一次提问才变，
+    正好等于「一次对话 = 一次用户提问 + 后续工具步进」。
+    """
+    if not isinstance(payload, dict):
+        return ""
+    msgs = payload.get("messages")
+    if not isinstance(msgs, list):
+        return ""
+    last_user = ""
+    system = ""
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "")
+        content = m.get("content")
+        if isinstance(content, list):
+            content = " ".join(str((p or {}).get("text") or "")
+                                for p in content if isinstance(p, dict))
+        text = str(content or "")
+        if role == "system" and not system:
+            system = text[:200]
+        elif role == "user":
+            last_user = text[:400]        # 一直覆盖到最后一条
+    if not last_user:
+        return ""
+    raw = "\x00".join([str(payload.get("model") or ""), system, last_user])
+    return "turn:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def conversation_identity(payload, client_session_key=None):
+    """本请求所属的上游会话身份（issue #128）。返回 {"id","begin_at"} 或 None。"""
+    if not CONVERSATION_SHARE:
+        return None
+    key = str(client_session_key or "").strip()
+    if key:
+        # issue #128 后续：窗口级 id 会把几小时的会话并成一条，用量面板看不出
+        # 单次对话时长。这里在显式键后追加「本轮提问」摘要 —— 同一次提问内的
+        # 工具步进仍归同一条，用户下次提问才换 id。
+        _turn = _conversation_key_from_history(payload)
+        if _turn:
+            key = key + "|" + _turn
+    else:
+        key = _conversation_key_from_history(payload)
+    if not key:
+        return None
+    now = time.time()
+    with _CONV_LOCK:
+        entry = _CONVERSATIONS.get(key)
+        if entry is not None and now - entry["at"] <= _CONV_TTL_SECS:
+            entry["at"] = now
+            _CONVERSATIONS.move_to_end(key)
+            return {"id": entry["id"], "begin_at": entry["begin_at"]}
+        entry = {"id": str(uuid.uuid4()), "begin_at": int(now * 1000), "at": now}
+        _CONVERSATIONS[key] = entry
+        _CONVERSATIONS.move_to_end(key)
+        while len(_CONVERSATIONS) > _CONV_MAX_ENTRIES:
+            _CONVERSATIONS.popitem(last=False)
+        return {"id": entry["id"], "begin_at": entry["begin_at"]}
+
 
 
 def extract_session_key(headers, payload):
@@ -7565,6 +7680,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
     全部账号失败后抛 RateLimited 或最后一个错误。
     """
     model = str(payload.get("model") or "")
+    # issue #128：整段对话复用同一上游会话身份（拿不到就 None = 旧行为）
+    _conv = conversation_identity(payload, session_key)
     if only_account is not None and not target_realm:
         # issue #86：钉死账号时区域跟随该账号（自动路由可能把它换掉）
         target_realm = getattr(only_account, "realm", "") or None
@@ -7584,7 +7701,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
     # issue #86：钉死账号时用它构造请求体（身份类字段必须与被测号一致）
     representative = (only_account if only_account is not None
                       else (POOL.pick(realm=realm) if POOL else None))
-    body_obj = build_qoder_body(payload, representative, model_key, realm=realm)
+    body_obj = build_qoder_body(payload, representative, model_key, realm=realm,
+                                  conversation=_conv)
     if usage_ctx is not None:
         # 实际下发档位直接取自请求体（build_qoder_body 只在 norm 非 None 时写入），
         # 与真实出站内容同源，不做二次推算。
@@ -7660,7 +7778,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         # Resolve only after choosing the actual account, before signing.
         assign_prefix_session(body_obj, account, model_key,
                               client_session_key=client_session_key,
-                              usage_ctx=usage_ctx)
+                              usage_ctx=usage_ctx,
+                              fallback_session_id=(_conv or {}).get("id"))
         encoded = qoder_encode(
             json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
         # 官方候选推理主机（国际版 api1/api2/api3）：传输层失败时切换域名，
@@ -8456,12 +8575,133 @@ def _is_custom_tool(tool):
     return isinstance(tool, dict) and str(tool.get("type") or "").lower() == "custom"
 
 
+_NS_MAX_DEPTH = 4
+_NS_CHILD_KEYS = ("tools", "children", "functions")
+
+
+def _tool_declared_name(tool):
+    """工具声明里的名字（Responses 平铺形态或 Chat function 形态）。"""
+    if not isinstance(tool, dict):
+        return ""
+    fn = tool.get("function")
+    name = tool.get("name") or (fn.get("name") if isinstance(fn, dict) else "")
+    return str(name or "").strip()
+
+
+def _is_namespace_tool(tool):
+    """是不是 Codex / MCP 的 namespace 容器（issue #127）。"""
+    if not isinstance(tool, dict):
+        return False
+    if str(tool.get("type") or "").strip() == "namespace":
+        return True
+    # 有些客户端省略 type，只给 name + children/functions/tools
+    if tool.get("type") in (None, ""):
+        for key in _NS_CHILD_KEYS:
+            if isinstance(tool.get(key), list) and tool.get(key):
+                return True
+    return False
+
+
+def _flatten_ns_tools(tools, depth=0, ns_map=None, seen=None):
+    """把 `type:"namespace"` 容器展开成平铺工具（issue #127 F1）。
+
+    Codex 把 MCP server / multi-agent 工具装在 namespace 容器里发出；上游只认
+    `function`，整块透传会 400（#63），此前的取舍是整块丢弃 —— 结果是工具静默
+    消失。展开的产物只有 function/custom 条目，容器本身不出站，不触发同一个
+    `unknown variant` 错误。
+
+    返回 (flat_tools, ns_map)：ns_map 记录「工具名 -> namespace」，用于回程把
+    namespace 字段补回（客户端按 (name, namespace, kind) 三元组匹配执行器）。
+    重名策略：同名只留第一个并打 WARN（两个 MCP server 有同名工具时展平后
+    无法区分，保留第一个至少让其中一个是可用的）。
+    """
+    ns_map = {} if ns_map is None else ns_map
+    seen = set() if seen is None else seen
+    flat = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        if _is_namespace_tool(tool):
+            if depth >= _NS_MAX_DEPTH:
+                log("namespace tool %r nested deeper than %d - dropped (issue #127)"
+                    % (_tool_declared_name(tool) or "?", _NS_MAX_DEPTH),
+                    level="WARN", tag="chat")
+                continue
+            ns = str(tool.get("name") or tool.get("namespace") or "").strip()
+            children = []
+            for key in _NS_CHILD_KEYS:
+                val = tool.get(key)
+                if isinstance(val, list) and val:
+                    children = val
+                    break
+            # 子层用**独立**的 seen：共享会让递归先登记、父层再判重时
+            # 把所有子工具都当成重复丢掉（issue #127 自查到）。
+            sub, _ = _flatten_ns_tools(children, depth + 1, ns_map, set())
+            for item in sub:
+                name = _tool_declared_name(item)
+                if name and name in seen:
+                    log("duplicate tool name %r after namespace flatten - "
+                        "keeping the first (issue #127)" % name,
+                        level="WARN", tag="chat")
+                    continue
+                if name:
+                    seen.add(name)
+                    if ns:
+                        ns_map[name] = ns
+                flat.append(item)
+            continue
+        name = _tool_declared_name(tool)
+        if name and name in seen:
+            log("duplicate tool name %r - keeping the first (issue #127)" % name,
+                level="WARN", tag="chat")
+            continue
+        if name:
+            seen.add(name)
+        flat.append(tool)
+    return flat, ns_map
+
+
+def _additional_tools_from_input(inp):
+    """收集 input 里的 additional_tools（Codex Desktop 0.162+，issue #127 F3）。"""
+    out = []
+    if not isinstance(inp, list):
+        return out
+    for item in inp:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "") not in ("additional_tools", "mcp_tools"):
+            continue
+        for key in ("tools", "value"):
+            val = item.get(key)
+            if isinstance(val, list):
+                out.extend(val)
+                break
+    return out
+
+
+def _stamp_tool_namespace(item, ns_map):
+    """回程：把 namespace 补到 function_call/custom_tool_call 项上（issue #127）。"""
+    if not isinstance(item, dict) or not ns_map:
+        return item
+    name = str(item.get("name") or "")
+    ns = ns_map.get(name) if name else None
+    if ns and not item.get("namespace"):
+        item["namespace"] = ns
+    return item
+
+
 def custom_tool_names(tools):
-    """Names of tools declared as freeform/custom in a Responses request."""
+    """Names of tools declared as freeform/custom in a Responses request.
+
+    issue #127：新版 Codex Desktop 会把 `exec` 这类 freeform 工具**嵌在
+    namespace 容器里**。不递归进来，回程就判成 function_call，客户端按
+    custom_tool_call 匹配不到执行器 —— 调用不执行、模型无限重试。
+    """
     names = set()
-    for t in tools or []:
-        if _is_custom_tool(t) and t.get("name"):
-            names.add(str(t["name"]))
+    flat, _ = _flatten_ns_tools(tools)
+    for t in flat:
+        if _is_custom_tool(t) and _tool_declared_name(t):
+            names.add(_tool_declared_name(t))
     return names
 
 
@@ -8724,8 +8964,16 @@ def responses_to_chat(payload):
         effort = payload.get("reasoning_effort")
     if effort:
         chat["reasoning_effort"] = effort
-    if payload.get("tools"):
-        chat["tools"] = _tools_for_chat(payload["tools"])
+    # issue #127：工具清单可能分两处（顶层 tools + input 里的 additional_tools），
+    # 且可能包在 type:"namespace" 容器里。先合并再展平，最后才做类型过滤。
+    _raw_tools = list(payload.get("tools") or [])
+    _raw_tools.extend(_additional_tools_from_input(payload.get("input")))
+    if _raw_tools:
+        _flat_tools, _ns_map = _flatten_ns_tools(_raw_tools)
+        chat["tools"] = _tools_for_chat(_flat_tools)
+        if _ns_map:
+            # 回程补 namespace 用（不下发给上游）
+            chat["_qd_tool_ns"] = _ns_map
     if payload.get("tool_choice"):
         chat["tool_choice"] = payload["tool_choice"]
     if payload.get("parallel_tool_calls") is not None:
@@ -8758,7 +9006,7 @@ def _responses_usage(u):
     }
 
 
-def chat_to_response(chat_obj, model, custom_names=None):
+def chat_to_response(chat_obj, model, custom_names=None, ns_map=None):
     """Fold a Chat Completions object into a Responses API response object.
 
     custom_names: the set of tool names the client declared as freeform.
@@ -8783,23 +9031,23 @@ def chat_to_response(chat_obj, model, custom_names=None):
         call_id = tc.get("id") or _new_id("call_")
         name = fn.get("name") or ""
         if name and name in custom_names:
-            output.append({
+            output.append(_stamp_tool_namespace({
                 "id": _new_id("ctc_"),
                 "type": "custom_tool_call",
                 "status": "completed",
                 "call_id": call_id,
                 "name": name,
                 "input": _unwrap_custom_input(fn.get("arguments") or ""),
-            })
+            }, ns_map))
         else:
-            output.append({
+            output.append(_stamp_tool_namespace({
                 "id": _new_id("fc_"),
                 "type": "function_call",
                 "status": "completed",
                 "call_id": call_id,
                 "name": name,
                 "arguments": fn.get("arguments") or "{}",
-            })
+            }, ns_map))
     # DeepSeek DSML 工具调用回退
     if not (msg.get("tool_calls")):
         dsml_calls, clean_t = parse_dsml_tool_calls(text)
@@ -8970,6 +9218,9 @@ def stream_responses_events(inner_lines, model, holder):
                     tool_calls_map[idx] = entry
                     item = {"id": entry["item_id"], "status": "in_progress",
                             "call_id": c_id, "name": fn_name}
+                    # issue #127：namespace 必须在 added 帧就带上，
+                    # 否则客户端按 (name, namespace, kind) 匹配不到执行器
+                    _stamp_tool_namespace(item, (holder or {}).get("tool_ns"))
                     if is_custom:
                         item["type"] = "custom_tool_call"
                         item["input"] = ""
@@ -9131,28 +9382,28 @@ def stream_responses_events(inner_lines, model, holder):
                 "call_id": entry["id"],
                 "input": _unwrap_custom_input(entry["arguments"]),
             })
-            fc_item = {
+            fc_item = _stamp_tool_namespace({
                 "id": entry["item_id"],
                 "type": "custom_tool_call",
                 "status": "completed",
                 "call_id": entry["id"],
                 "name": entry["name"],
                 "input": _unwrap_custom_input(entry["arguments"]),
-            }
+            }, (holder or {}).get("tool_ns"))
         else:
             yield ev("response.function_call_arguments.done", {
                 "output_index": entry["output_index"],
                 "call_id": entry["id"],
                 "arguments": entry["arguments"],
             })
-            fc_item = {
+            fc_item = _stamp_tool_namespace({
                 "id": entry["item_id"],
                 "type": "function_call",
                 "status": "completed",
                 "call_id": entry["id"],
                 "name": entry["name"],
                 "arguments": entry["arguments"],
-            }
+            }, (holder or {}).get("tool_ns"))
         outputs[entry["output_index"]] = fc_item
         yield ev("response.output_item.done",
                  {"output_index": entry["output_index"], "item": fc_item})
@@ -9856,12 +10107,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, update_plan_info())
         if path == "/diag/vm":
             # 本机虚拟化检测（看板「签到与福利中心」展示；中文输出）。
-            # 以官方风控桥 runtime-info.exe 的 vmInfo 为准，桥不可用时本机交叉校验。
+            # 以官方风控桥 runtime-info 的 vmInfo 为准，桥不可用时本机交叉校验。
+            # issue #123 后续：把「判定来源」与「桥是否真的可用」一并回显，
+            # 否则用户看到「本地：单板计算机」+「官方风控：KVM」会以为是自相矛盾。
             _q = parse_qs(urlparse(self.path).query)
             try:
-                return self._json(200, local_vm_status(
-                    _q.get("realm", [None])[0] or CURRENT_REALM,
-                    force=bool(_q.get("force", [None])[0])))
+                _realm = _q.get("realm", [None])[0] or CURRENT_REALM
+                _st = local_vm_status(_realm, force=bool(_q.get("force", [None])[0]))
+                _exe = qoder_accounts.runtime_info_exe(_realm)
+                _raw = qoder_accounts.run_runtime_info(_realm) or {}
+                _vmi = _raw.get("vmInfo") if isinstance(_raw.get("vmInfo"), dict) else {}
+                _st["bridge_exe"] = _exe or ""
+                _st["bridge_available"] = bool(_exe)
+                _st["bridge_vm_info"] = {
+                    k: _vmi.get(k) for k in
+                    ("isVm", "brand", "percentage", "vmTypeCode")
+                    if k in _vmi}
+                _st["local_evidence"] = list(_st.get("evidence") or [])
+                return self._json(200, _st)
             except Exception as exc:
                 return self._error(500, "vm status failed: %s" % exc)
         if path == "/health":
@@ -11087,6 +11350,25 @@ class Handler(BaseHTTPRequestHandler):
                                         "status": 429,
                                         "error": "rate limited: %s" % exc.detail[:150],
                                         "elapsed_ms": wall_ms})
+            except UpstreamStatus as exc:
+                # issue #123 后续：信封层 403/429 以前落到通用分支，只显示
+                # "upstream status 403"，看不到业务码（10605/112/110）——
+                # 把 detail 原样带回面板，并按已知码给出人话解释。
+                wall_ms = int((time.time() - t0) * 1000)
+                _detail = str(getattr(exc, "detail", "") or "")[:400]
+                _hint = _quota_hint(_detail)
+                account.note_error("HTTP %s: %s" % (exc.status, _detail[:80]),
+                                   cooldown=60)
+                log("account test: uid=%s model=%s wall=%dms upstream=%s %s"
+                    % (account.uid[:8], test_model, wall_ms, exc.status,
+                       _hint or _detail[:120]), level="WARN", tag="accounts")
+                return self._json(200, {"ok": False, "uid": account.uid,
+                                        "status": exc.status,
+                                        "error": "upstream HTTP %s: %s"
+                                        % (exc.status, _detail[:200]),
+                                        "detail": _detail,
+                                        "hint": _hint,
+                                        "elapsed_ms": wall_ms})
             except urllib.error.HTTPError as exc:
                 wall_ms = int((time.time() - t0) * 1000)
                 try:
@@ -11503,8 +11785,11 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_responses(self, payload):
         """Serve /v1/responses by translating to chat completions upstream."""
         session_key = extract_session_key(self.headers, payload)
-        custom_names = custom_tool_names(payload.get("tools"))
         chat_req = responses_to_chat(payload)
+        # issue #127：custom 判型必须用**合并 + 展平后**的清单（顶层 tools 与
+        # input.additional_tools 都可能含容器），否则回程判型与出站不一致。
+        custom_names = custom_tool_names(chat_req.get("tools") or [])
+        tool_ns = chat_req.get("_qd_tool_ns") or {}
         self._apply_context_header(chat_req)  # issue #106
         model = payload.get("model") or "auto"
         want_stream = bool(payload.get("stream"))
@@ -11515,6 +11800,7 @@ class Handler(BaseHTTPRequestHandler):
                chat_req.get("reasoning_effort"),
                sorted(custom_names) or "-"))
         holder = {"usage": None, "custom_names": custom_names,
+                  "tool_ns": tool_ns,
                   "allowed_names": _tool_names_from_payload(chat_req)}
         # account 预置在 try 之外：下面所有 except 里的 record_error 都会引用它，
         # 而选号成功前它就是 None。放在 try 内、open_upstream 之前也行 —— 只要
@@ -11785,7 +12071,8 @@ class Handler(BaseHTTPRequestHandler):
                              key_id=self._key_id_for_usage())
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
-            result = chat_to_response(chat_obj, model, custom_names)
+            result = chat_to_response(chat_obj, model, custom_names,
+                                       ns_map=tool_ns)
             record_usage(model, chat_obj.get("usage"), stream=False,
                          elapsed_ms=wall, fp=fp, account=account.uid,
                          effort=usage_ctx.get("effort"),

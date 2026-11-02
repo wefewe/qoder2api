@@ -888,6 +888,33 @@ CREDIT_USAGE_TTL = 300
 # gap 未透传时的安全默认，保持「>= 1.0s 防风控」语义（见 qoder_tasks 模块声明）。
 CLAIM_GAP_DEFAULT = 1.0
 
+def _campaign_list_needs_retry(st, only_kinds=None):
+    """活动列表要不要重试（issue #130）。
+
+    只在「查询成功但**没有可领项**」时重试：空列表、showCampaign=false、
+    或列表里没有任何 claim_status=CLAIMABLE 且属于 only_kinds 的活动。
+    查询本身失败不在这里重试（上层有自己的错误路径）。
+    """
+    if not isinstance(st, dict) or not st.get("ok"):
+        return False
+    items = st.get("campaigns") or []
+    if not items:
+        return True
+    if st.get("show_campaign") is False and not st.get("claimable"):
+        return True
+    for c in items:
+        if not isinstance(c, dict):
+            continue
+        if str(c.get("claim_status") or "").upper() != "CLAIMABLE":
+            continue
+        if only_kinds is not None:
+            kind = str((c.get("benefit") or {}).get("kind") or "").upper()
+            if kind not in only_kinds:
+                continue
+        return False
+    return True
+
+
 def campaign_label(c):
     """活动显示名：官方中文标题（placements content.zh.title）优先，其次 key。"""
     c = c or {}
@@ -2740,7 +2767,20 @@ class Account(object):
         # force 会让每次签到都换一套身份并把落盘缓存刷掉，「重建不换」就失效了
         # （设计 §9.1）。身份真被服务端作废时由 campaigns() 的自愈兜底刷新。
         native_machine_identity(self.realm, self.uid)
+        # issue #130：同一请求上游偶发返回「没有每日活动 / claimable=false」
+        # （报告者实测 10 次里 2 次），一次空结果就放弃会让当天签到直接丢掉。
+        # 这里对**空结果/无可领项**重试两次（0.8s、2.0s 退避），拿到可领项即停。
         st = self.campaigns(force=True)      # 领取路径必须绕过缓存，看最新状态
+        for _wait in (0.8, 2.0):
+            if not _campaign_list_needs_retry(st, only_kinds):
+                break
+            try:
+                time.sleep(_wait)
+            except Exception:
+                pass
+            _retry = self.campaigns(force=True)
+            if _retry.get("ok"):
+                st = _retry
         if not st.get("ok"):
             next_at, next_note = next_checkin_window()
             return {"ok": False, "error": st.get("error") or "campaigns 查询失败",

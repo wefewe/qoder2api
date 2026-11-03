@@ -1428,6 +1428,27 @@ def http_json(url, data=None, method=None, headers=None, timeout=30,
 # ---------------------------------------------------------------------------
 # Account
 # ---------------------------------------------------------------------------
+# issue #131-4：accounts/ 下与**系统文件/目录**同名的 uid 必须挡住 —— 否则
+# 导入一个 uid="settings" 的账号会写进 accounts/settings.json，把面板密码摘要与
+# API Key 列表整体覆盖（实测会导致默认密码 admin 重新可用、Key 全清）。
+RESERVED_ACCOUNT_UIDS = frozenset({
+"settings", "machine_identity", "usage", "usage-summary",
+"scheduler", "state", "models-cache", "max-output-limits",
+})
+
+
+def is_reserved_account_uid(uid):
+    """该 uid 会不会撞上 accounts/ 里的系统文件（issue #131-4）。"""
+    low = str(uid or "").strip().lower()
+    if not low:
+        return False
+    if low in RESERVED_ACCOUNT_UIDS:
+        return True
+    # 前缀撞车也要挡：models-cache-cn / usage-2026 之类同样是系统命名空间
+    return any(low.startswith(prefix + "-") for prefix in (
+        "models-cache", "max-output-limits", "usage"))
+
+
 class Account(object):
     def __init__(self, data, path=None):
         data = data or {}
@@ -1687,6 +1708,9 @@ class Account(object):
         base = Path(directory).resolve()
         base.mkdir(parents=True, exist_ok=True)
         safe_uid = re.sub(r"[^A-Za-z0-9_-]", "_", str(self.uid or "")).strip("_ ")
+        if is_reserved_account_uid(safe_uid):
+            # 双重防线：即使上游没拦住，落盘这一步也不许覆盖系统文件。
+            raise ValueError("reserved account uid: %r" % safe_uid)
         name = (safe_uid or uuid.uuid4().hex) + ".json"
         path = base / name
         tmp = base / (name + ".tmp")
@@ -1700,6 +1724,7 @@ class Account(object):
             os.replace(tmp, path)
         self.path = str(path)
         return self.path
+
     def delete(self):
         if self.path and os.path.exists(self.path):
             os.remove(self.path)
@@ -4552,6 +4577,11 @@ def normalise_import_row(row, realm=None):
     uid = re.sub(r"[^A-Za-z0-9_-]", "_", raw_uid).strip("_ ")
     if not uid:
         uid = "p-" + uuid.uuid4().hex[:24]
+    elif is_reserved_account_uid(uid):
+        # issue #131-4：第三方账号文档可能带这种记录；明确拒绝，
+        # 而不是静默改名（改名会让用户以为导入成功却多出一个假号）。
+        raise ValueError("uid %r is reserved by system files; rename the "
+                         "record before importing" % uid)
     exp = normalize_epoch(pick("expiresAt"))
     if not exp:
         exp = int(time.time()) + 3600

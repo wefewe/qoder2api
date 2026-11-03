@@ -5476,6 +5476,11 @@ async function saveApiKeys(btn){
     // Blank means "keep the stored key", which the server honours per row.
     key: (row.key || '').trim(),
     note: (row.note || '').trim(),
+    // issue #131-1：白名单必须随载荷回去 —— 少了它服务端只能按「没提交」
+    // 处理（会保留旧值），但显式清空就再也做不到了；带上才能区分两者。
+    // 没有该字段时 JSON 序列化会直接丢掉它 -> 服务端按「未提交」保留旧值；
+    // 只有真的加载过白名单的行才会显式提交（含空数组=清除限制）。
+    models: Array.isArray(row.models) ? row.models.slice() : undefined,
   }));
   const newRow = API_KEY_ROWS.find(row => !row.masked && !(row.key || '').trim());
   if(newRow){

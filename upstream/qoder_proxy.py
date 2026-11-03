@@ -64,7 +64,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.18"
+VERSION = "1.7.19"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2336,6 +2336,10 @@ def runtime_settings_view():
             else "*" * len(raw),
             "source": entry.get("source") or "panel",
             "created_at": entry.get("created_at") or "",
+            # issue #131-1：白名单与备注必须回显 —— 面板「读 → 改 → 存」是一条
+            # 全量覆盖链，视图里没有的字段会被前端当成空值写回去（等于放大授权）。
+            "models": list(entry.get("models") or []),
+            "note": entry.get("note") or "",
         })
     return {
         "panel_password_is_default":
@@ -10827,6 +10831,16 @@ class Handler(BaseHTTPRequestHandler):
                     or (existing.get(entry_id, {}).get("created_at")
                         if entry_id in existing else None) \
                     or time.strftime("%Y/%m/%d %H:%M")
+                # issue #131-1：区分「字段没提交」与「显式提交空列表」。
+                # 老客户端/精简载荷不含 models 时保留旧白名单，只有明确写
+                # [] 才表示「清除限制」——否则一次改名就能把授权范围放大。
+                _prev = existing.get(entry_id) or {}
+                if "models" in item:
+                    models_val = item.get("models")
+                else:
+                    models_val = _prev.get("models")
+                note_val = (str(item.get("note")).strip()
+                            if "note" in item else (_prev.get("note") or ""))
                 cleaned.append({
                     "id": entry_id,
                     "name": str(item.get("name") or "").strip(),
@@ -10834,9 +10848,10 @@ class Handler(BaseHTTPRequestHandler):
                     "realm": realm,
                     "enabled": item.get("enabled", True) is not False,
                     "created_at": created_at,
-                    # P1-4：每 Key 模型白名单（原样透传；规范化统一在
+                    # P1-4：每 Key 模型白名单（规范化统一在
                     # qoder_settings._clean_key_entry 一处完成）。
-                    "models": item.get("models"),
+                    "models": models_val,
+                    "note": note_val,
                 })
             qoder_settings.set_api_keys(ACCOUNTS_DIR, cleaned)
             reply["api_keys_saved"] = len(cleaned)
@@ -10936,6 +10951,12 @@ class Handler(BaseHTTPRequestHandler):
                     qoder_settings.panel_password_is_default(ACCOUNTS_DIR),
             })
         if path == "/panel/logout":
+            # issue #131-5：先认证再吊销。revoke_all() 会换签名密钥，等于把
+            # **所有**已登录浏览器踢下线；此前它在 _panel_ok() 之前执行，任
+            # 何能连到端口的人不带任何凭据就能做到这件事。
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
             # 退出登录不能只往内存黑名单里写一笔：那份 dict 重启即丢，已退出的
             # token 会活到 TTL（7 天）结束——比改动前的「重启全清」更差。
             # 直接换密钥：本 token 与其它浏览器的会话一起作废。本地单人面板无感，
@@ -11716,12 +11737,19 @@ class Handler(BaseHTTPRequestHandler):
         chat_req["tools"] = rewrite_web_tools(chat_req.get("tools") or [], names)
         chat_req["stream"] = False
         model = str(chat_req.get("model") or "")
+        # issue #131-2：这条分支此前直接 open_upstream，跳过了模型封禁与 Key
+        # 白名单 —— 只要声明一个 web_search/web_fetch 就能用本不该授权的模型。
+        # 授权必须与协议/工具无关，统一在分流之后、推理之前判一次。
+        _blocked = self._model_precheck(model, self._request_realm())
+        if _blocked:
+            return self._error(400, _blocked, "invalid_request_error")
         session_key = extract_session_key(self.headers, payload)
         messages = list(chat_req.get("messages") or [])
         realm = self._request_realm()
         usage_ctx = {"tenant_scope": self._key_id_for_usage()}
         obj = None
         rounds = 0
+        _acc = {}          # 多轮消耗累加（issue #131-3）
         for _ in range(max(1, WEB_TOOLS_MAX_ROUNDS)):
             req = dict(chat_req, messages=messages)
             try:
@@ -11736,10 +11764,39 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(exc.code, msg, etype)
             except Exception as exc:
                 return self._error(502, str(exc)[:200], "upstream_error")
+            _round_t0 = time.time()
             with resp:
                 obj = aggregate_stream(resp, model,
                                        holder={"usage": None},
                                        allowed_names=names)
+            # issue #131-3：这条分支此前完全不记账 —— 看板/按 Key 账号统计、
+            # 以及按本地流水折叠的每日限额都漏掉这部分消耗。每轮都记一条
+            # （账号/Key/模型与真实出站一致），并累加成总数回给客户端。
+            _u = obj.get("usage") or {}
+            if _u:
+                try:
+                    record_usage(model, _u, stream=want_stream,
+                                 elapsed_ms=int((time.time() - _round_t0) * 1000),
+                                 account=account.uid if account else None,
+                                 effort=usage_ctx.get("effort"),
+                                 effort_requested=usage_ctx.get("effort_requested"),
+                                 key_id=self._key_id_for_usage(),
+                                 realm_reason=usage_ctx.get("realm_reason", ""),
+                                 session_trace=usage_ctx)
+                except Exception as exc:
+                    log("web tools: record_usage failed: %s" % exc,
+                        level="WARN", tag="webtools")
+                for _k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    try:
+                        _acc[_k] = _acc.get(_k, 0) + int(_u.get(_k) or 0)
+                    except (TypeError, ValueError):
+                        pass
+                for _k in ("credits", "credit"):
+                    if _u.get(_k) is not None:
+                        try:
+                            _acc[_k] = float(_acc.get(_k) or 0) + float(_u[_k])
+                        except (TypeError, ValueError):
+                            pass
             msg = ((obj.get("choices") or [{}])[0].get("message") or {})
             calls = [c for c in (msg.get("tool_calls") or [])
                      if (c.get("function") or {}).get("name") in names]
@@ -11765,6 +11822,11 @@ class Handler(BaseHTTPRequestHandler):
         self.realm_used = usage_ctx.get("realm") or (realm or "")
         obj = obj or {"choices": [{"index": 0, "message": {"role": "assistant",
                                    "content": ""}, "finish_reason": "stop"}]}
+        if _acc:
+            # 多轮合计回给客户端：客户端只看到一次请求，但上游扣的是每轮的钱。
+            _usage = dict(obj.get("usage") or {})
+            _usage.update({k: v for k, v in _acc.items() if v})
+            obj = dict(obj, usage=_usage)
         if is_responses:
             if not want_stream:
                 return self._json(200, chat_to_response(obj, model))

@@ -64,7 +64,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.19"
+VERSION = "1.7.22"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -494,6 +494,11 @@ def _extract_usage(usage):
         "cached_tokens": usage.get("cached_tokens")
         or usage.get("prompt_cache_hit_tokens")
         or details.get("cached_tokens") or prompt_details.get("cached_tokens") or 0,
+        # issue #129 后续：区分「真的没命中」与「上游没回报缓存字段」；
+        # 后者在面板显示成 `?`，且不计入「全价请求」。
+        "cached_reported": bool(
+            "cached_tokens" in usage or "prompt_cache_hit_tokens" in usage
+            or "cached_tokens" in details or "cached_tokens" in prompt_details),
         "total_tokens": usage.get("total_tokens") or 0,
         # issue #22：上游给的是**复数 credits** —— 旧实现只读单数 credit，
         # 恒为 None -> 所有 usage 记录成 0（历史数据无法回填，原始值未落盘）。
@@ -533,6 +538,41 @@ def row_matches_realm(row, realm):
     if model:
         return detect_model_realm(model) == realm
     return realm == "cn"
+
+
+# issue #129 后续：积分三段折算系数（每千 token 的积分）。默认值来自报告者的实测
+# 拟合（244 条 DeepSeek-Flash 实扣 + 110 条 Qwen3.8-Flash 名义，残差 <1%）；
+# 可用 QD_CREDIT_COEF="非缓存,缓存,输出" 覆盖成自己算出来的系数。
+_CREDIT_COEF_DEFAULT = (1.069, 0.086, 4.277)
+
+
+def credit_coefficients():
+    """(非缓存输入, 缓存输入, 输出) 每千 token 积分系数。"""
+    raw = str(os.environ.get("QD_CREDIT_COEF") or "").strip()
+    if raw:
+        try:
+            parts = [float(x) for x in raw.replace(",", " ").split()]
+            if len(parts) == 3 and all(x >= 0 for x in parts):
+                return tuple(parts)
+        except Exception:
+            pass
+    return _CREDIT_COEF_DEFAULT
+
+
+def split_credit(prompt_tokens, cached_tokens, completion_tokens):
+    """按三段折算积分：非缓存输入 / 缓存输入 / 输出（issue #129 后续）。"""
+    a, b, c = credit_coefficients()
+    try:
+        p = max(0, int(prompt_tokens or 0))
+        cached = max(0, int(cached_tokens or 0))
+        out = max(0, int(completion_tokens or 0))
+    except (TypeError, ValueError):
+        return {"input": 0.0, "cached": 0.0, "output": 0.0}
+    cached = min(cached, p)
+    fresh = max(0, p - cached)
+    return {"input": round(fresh * a / 1000.0, 4),
+            "cached": round(cached * b / 1000.0, 4),
+            "output": round(out * c / 1000.0, 4)}
 
 
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
@@ -1148,6 +1188,18 @@ def recent_usage(limit=100, realm=None, page=1):
     start_idx = (page - 1) * limit
     end_idx = start_idx + limit
     page_rows = matching[start_idx:end_idx]
+    # issue #129 后续：每行带上「积分三段折算」（非缓存输入 / 缓存输入 / 输出），
+    # 让面板单行就能看出成本落在哪一段；'billable=false' 的行是名义成本，
+    # 前端会换样式标注，避免被当成真实扣费。
+    for _row in page_rows:
+        if not isinstance(_row, dict) or _row.get("error"):
+            continue
+        try:
+            _row["credit_split"] = split_credit(_row.get("prompt_tokens"),
+                                                _row.get("cached_tokens"),
+                                                _row.get("completion_tokens"))
+        except Exception:
+            pass
     return {
         "total": total,
         "page": page,
@@ -1884,6 +1936,10 @@ def _day_key(ts):
         return ""
 
 
+# issue #129 后续：多少 prompt token 以上、且缓存为 0，算「全价请求」
+FULL_PRICE_PROMPT_MIN = int(os.environ.get("QD_FULL_PRICE_PROMPT_MIN") or 100000)
+
+
 def compute_usage_stats(range=None, since=None, until=None,
                         heatmap_days=365, top_n=5):
     """统计概览页所需的全部数据（单次扫描 usage.jsonl）。
@@ -1898,6 +1954,11 @@ def compute_usage_stats(range=None, since=None, until=None,
 
     tot = {"requests": 0, "errors": 0, "tokens": 0,
            "prompt": 0, "completion": 0, "cached": 0}
+    # issue #129 后续：报告者按小时拟合出的最大成本项是「缓存为 0 的超长 prompt」
+    # （一天里 9 次这类请求就占了 30% 积分）。这里把这类请求单独计数并统计积分占比，
+    # 让用户能直接看到「换前缀 / 新开会话」的代价。
+    full_price = {"requests": 0, "prompt": 0, "credit": 0.0}
+    total_credit = 0.0
     models = {}       # model -> {"tokens","requests"}
     accounts = {}     # account -> {"tokens","requests"}
     providers = {}    # provider -> {"tokens","requests"}
@@ -1967,6 +2028,21 @@ def compute_usage_stats(range=None, since=None, until=None,
                     tot["prompt"] += prompt
                     tot["completion"] += int(r.get("completion_tokens") or 0)
                     tot["cached"] += cached
+                    _credit = r.get("credit") or 0
+                    try:
+                        _credit = float(_credit)
+                    except (TypeError, ValueError):
+                        _credit = 0.0
+                    total_credit += _credit
+                    # 缓存字段**缺失**的行（老模型不回报）不算「全价」——按全价估会偏高。
+                    _cached_known = r.get("cached_reported")
+                    if _cached_known is None:
+                        _cached_known = True     # 历史行没有该字段：按旧口径计入
+                    if (prompt >= FULL_PRICE_PROMPT_MIN and cached <= 0
+                            and _cached_known):
+                        full_price["requests"] += 1
+                        full_price["prompt"] += prompt
+                        full_price["credit"] += _credit
                     m = r.get("model") or "(unknown)"
                     _bump(models, m, tokens)
                     _bump(accounts, r.get("account") or "(unattributed)", tokens)
@@ -2057,6 +2133,14 @@ def compute_usage_stats(range=None, since=None, until=None,
         "models": _rank(models, 10),
         "providers": _rank(providers, 10),
         "cache": {"windows": cache_rows},
+        "full_price": {
+            "requests": full_price["requests"],
+            "prompt": full_price["prompt"],
+            "credit": round(full_price["credit"], 2),
+            "credit_share": (round(full_price["credit"] * 100.0 / total_credit, 1)
+                             if total_credit > 0 else None),
+            "threshold": FULL_PRICE_PROMPT_MIN,
+        },
         "hourly": {"points": hours},
         "heatmap": {"days": heat_days,
                      "max": max([d["tokens"] for d in heat_days] or [0])},
@@ -4296,6 +4380,17 @@ def _echo_names_all_undeclared(text, allowed_names):
     return all(n not in allowed_names for n in names)
 
 
+# issue #135：工具协议回声的收尾策略。
+#   strict  （默认）= fail-closed：流式响应以 response.failed / error 帧收尾，
+#                     让客户端知道这一轮没有完成（correctness 优先）。
+#   lenient        = 遇到 InvalidToolArguments 时**按正常结束收尾**（保留已产生的
+#                     正文），用于上游爱吐协议残片的模型（实测 Qwen3.8-Flash），
+#                     避免 Codex 这类客户端在收到 failed 后直接静默结束对话。
+TOOL_ECHO_MODE = (os.environ.get("QD_TOOL_ECHO_MODE") or "strict").strip().lower()
+if TOOL_ECHO_MODE not in ("strict", "lenient"):
+    TOOL_ECHO_MODE = "strict"
+
+
 class InvalidToolArguments(UpstreamStatus):
     """已确认是工具协议回声，但内层 arguments 不是合法 JSON（issue #37）。
 
@@ -6054,6 +6149,40 @@ MAX_UPSTREAM_BODY_BYTES = int(float(os.environ.get("QD_MAX_BODY_MB") or 29)
 def _keep_toplevel_images():
     """是否保留顶层冗余图片字段（默认否，issue #59）。"""
     return str(os.environ.get("QD_KEEP_TOPLEVEL_IMAGES") or "").strip().lower()         in ("1", "on", "true", "yes")
+
+
+def _default_test_model(realm=None):
+    """账号「测试」的默认模型：优先**免费**模型（issue #134）。
+
+    面板测试的定位是「凭证 + 通道是否活着」。此前固定 auto，零额度账号必然
+    403（code 112），看起来像凭证坏了。免费模型的成本是 0，最适合探活；
+    找不到免费模型时退回 auto（保持旧行为，不猜）。
+    """
+    r = realm if realm in ("cn", "intl") else CURRENT_REALM
+    try:
+        models = [m for m in qoder_catalog.models_for_realm(r)
+                  if isinstance(m, dict) and m.get("enable") is not False]
+    except Exception:
+        models = []
+
+    def _name(m):
+        try:
+            return str(qoder_catalog.display_id(m) or m.get("key") or "")
+        except Exception:
+            return str(m.get("key") or "")
+
+    # 三层优先级：真正 0 价（price_factor == 0）> 标了 is_free > auto。
+    # 注意 is_free 的语义是「含免费权益」，不代表 0 价（Qwen3.8-Max 是 0.2x），
+    # 所以不能用它当第一档（issue #134 里报告者也提到要挑免费模型）。
+    for pick in (lambda m: m.get("price_factor") == 0,
+                 lambda m: bool(m.get("is_free"))):
+        for m in models:
+            try:
+                if pick(m) and _name(m):
+                    return _name(m)
+            except Exception:
+                continue
+    return "auto"
 
 
 def _quota_hint(detail):
@@ -9571,6 +9700,25 @@ def stream_responses_events(inner_lines, model, holder):
     yield ev("response.completed", {"response": final})
 
 
+def _responses_completed_quiet(holder, model=""):
+    """issue #135：lenient 模式下用「正常完成」收尾（保留已产出的正文）。"""
+    holder = holder or {}
+    text = holder.get("text") or holder.get("content") or ""
+    return ("event: response.completed\ndata: " + json.dumps({
+        "type": "response.completed",
+        "response": {
+            "id": holder.get("id") or "resp_lenient",
+            "object": "response",
+            "status": "completed",
+            "model": model or "",
+            "output": ([{"type": "message", "role": "assistant",
+                          "content": [{"type": "output_text", "text": text}]}]
+                        if text else []),
+            "usage": _responses_usage(holder.get("usage")) or {},
+        },
+    }, ensure_ascii=False) + "\n\n")
+
+
 def _responses_failed_frame(holder, code, message):
     """Responses 流的终态失败事件（response.failed）。
 
@@ -10105,10 +10253,29 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/update/plan":
             # 一键更新前的预检（issue: 一键更新）：能不能更新、当前/目标版本、
             # 是否容器、是否被禁用。不下载任何东西。
+            # issue #132：面板只凭 /update/check 的 has_update 就渲染按钮，
+            # 在「环境变量禁用 / 容器内 / 非本机访问」三种必然失败的情况下
+            # 仍然给出一个按了就报错的动作。这里把**权威可执行性**一并回显。
             if not self._panel_ok():
                 return self._error(401, "panel password required",
                                    "invalid_request_error")
-            return self._json(200, update_plan_info())
+            _info = update_plan_info()
+            _client = (self.client_address or ["?"])[0]
+            _loopback = _is_loopback(_client)
+            _reasons = []
+            if _info.get("disabled"):
+                _reasons.append("已被环境变量禁用（QD_UPDATE_DISABLE=1）")
+            if _info.get("container"):
+                _reasons.append("运行在容器里：请改用镜像更新")
+            if not _loopback and not _update_allow_remote():
+                _reasons.append("仅允许在本机打开面板执行"
+                                "（或设置 QD_UPDATE_ALLOW_REMOTE=1）")
+            if not _info.get("has_update"):
+                _reasons.append("当前已是最新版本")
+            _info["client_is_loopback"] = bool(_loopback)
+            _info["can_apply"] = bool(_info.get("can_apply")) and not _reasons
+            _info["apply_blocked_reasons"] = _reasons
+            return self._json(200, _info)
         if path == "/diag/vm":
             # 本机虚拟化检测（看板「签到与福利中心」展示；中文输出）。
             # 以官方风控桥 runtime-info 的 vmInfo 为准，桥不可用时本机交叉校验。
@@ -11337,7 +11504,10 @@ class Handler(BaseHTTPRequestHandler):
             account = POOL.get(uid)
             if not account:
                 return self._error(404, "no such account")
-            test_model = payload.get("model") or "auto"
+            # issue #134：默认用免费模型探活，零额度号也能测出凭证好坏；
+            # 显式传 model 时仍以调用方为准。
+            test_model = (payload.get("model")
+                          or _default_test_model(acc_realm(account)))
             test_payload = {
                 "model": test_model,
                 "messages": [{"role": "user", "content": "hi"}],
@@ -11378,8 +11548,13 @@ class Handler(BaseHTTPRequestHandler):
                 wall_ms = int((time.time() - t0) * 1000)
                 _detail = str(getattr(exc, "detail", "") or "")[:400]
                 _hint = _quota_hint(_detail)
-                account.note_error("HTTP %s: %s" % (exc.status, _detail[:80]),
-                                   cooldown=60)
+                # issue #134：额度耗尽的号本来就不能服务请求，**测试**再去给它
+                # 叠一分钟冷却纯属副作用（连点两次测试就把它压住了）。
+                # 只有真正的凭证/服务端故障才记冷却。
+                if "112" not in _detail and "110" not in _detail \
+                        and "10605" not in _detail and "isQueued" not in _detail:
+                    account.note_error(
+                        "HTTP %s: %s" % (exc.status, _detail[:80]), cooldown=60)
                 log("account test: uid=%s model=%s wall=%dms upstream=%s %s"
                     % (account.uid[:8], test_model, wall_ms, exc.status,
                        _hint or _detail[:120]), level="WARN", tag="accounts")
@@ -12077,6 +12252,29 @@ class Handler(BaseHTTPRequestHandler):
                             cur.close()
                         except Exception:
                             pass
+                if pump_exc is not None and isinstance(
+                        pump_exc, InvalidToolArguments) \
+                        and TOOL_ECHO_MODE == "lenient":
+                    # issue #135：上游只吐了工具协议残片（Qwen3.8-Flash 实测高频）。
+                    # strict（默认）会让这一轮流以 response.failed 结束，某些客户端
+                    # （Codex）收到后直接静默结束对话 —— 用户看到的就是「话说到一半
+                    # 突然没了，而且没有任何提示」。lenient 下改为正常收尾：保留已产生
+                    # 的正文，本轮算完成，用户可以直接继续。
+                    log("lenient tool-echo: converting fail-closed to normal "
+                        "completion (%s) - issue #135" % str(pump_exc)[:160],
+                        level="WARN", tag="chat")
+                    record_error(model, 200, "lenient_tool_echo: %s"
+                                 % str(pump_exc)[:160],
+                                 elapsed_ms=int((time.time() - t_start) * 1000),
+                                 stream=True,
+                                 account=account.uid if account else None,
+                                 key_id=self._key_id_for_usage())
+                    try:
+                        self._sse_write(_responses_completed_quiet(holder, model))
+                    except Exception:
+                        pass
+                    self._sse_end()
+                    return
                 if pump_exc is not None:
                     # issue #100：pump 出来的可能是 RateLimited（排队耗尽），
                     # 它没有 .status —— 统一经 _exc_http_status 取，别再裸读。

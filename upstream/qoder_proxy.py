@@ -57,6 +57,9 @@ import qoder_catalog
 import qoder_keepalive
 import qoder_images
 import qoder_cache
+import qoder_routing
+import qoder_admin
+import qoder_logpaths
 import qoder_pricing
 import qoder_settings
 import qoder_session_cache
@@ -68,7 +71,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -412,8 +415,8 @@ _models_cache = {"intl": {"at": 0.0, "data": None}, "cn": {"at": 0.0, "data": No
 
 # Usage accounting: every upstream response carries a usage block, and the
 # proxy also records one JSONL line per request.
-USAGE_DIR = os.environ.get("QD_PROXY_USAGE_DIR") \
-    or os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage")
+LOG_DIR = qoder_logpaths.resolve_log_root(os.path.dirname(os.path.abspath(__file__)))
+USAGE_DIR = qoder_logpaths.resolve_usage_dir(os.path.dirname(os.path.abspath(__file__)))
 USAGE_LOG = os.path.join(USAGE_DIR, "usage.jsonl")
 USAGE_SUMMARY = os.path.join(USAGE_DIR, "usage-summary.json")
 DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -609,7 +612,7 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
         row.update(fp)
     if session_trace:
         # Never serialize tenant identifiers, client conversation IDs or prompts.
-        for field in ("session_affinity", "upstream_session_id"):
+        for field in ("session_affinity", "upstream_session_id", "route_rule"):
             if session_trace.get(field):
                 row[field] = session_trace[field]
     if account:
@@ -2486,6 +2489,8 @@ def runtime_settings_view():
             # 全量覆盖链，视图里没有的字段会被前端当成空值写回去（等于放大授权）。
             "models": list(entry.get("models") or []),
             "note": entry.get("note") or "",
+            "account_ids": list(entry.get("account_ids") or []),
+            "account_groups": list(entry.get("account_groups") or []),
         })
     return {
         "panel_password_is_default":
@@ -2509,6 +2514,7 @@ def runtime_settings_view():
         "web_tools_rounds": WEB_TOOLS_MAX_ROUNDS,
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
+        "log_dir": LOG_DIR,
         "settings_file": qoder_settings.settings_path(ACCOUNTS_DIR),
         "version": VERSION,
     }
@@ -5757,16 +5763,12 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             # issue #72：**不要把「残缺工具回声」当成功结束**。此前吞掉后按
             # stop 收尾，coding agent 会认为任务做完了（静默中断，比报错更难查）。
             # 客户端声明了 tools 且本轮没有一个可用调用 -> fail-closed，让客户端重试。
-            if allowed_names and _marker_only_echo(hold):
-                _kind = "marker_only" if _marker_only_echo(hold) else "partial_array"
-                log("dropped truncated leaked tool-call echo (%d chars, %s, "
-                    "tools_declared=%d) — failing the turn closed (issue #72)"
-                    % (len(hold), _kind, len(allowed_names)),
-                    level="WARN", tag="chat")
-                raise EmptyToolEcho(len(hold), _kind)
-            # issue #9：未声明工具时仍按原样吞掉（无可恢复的调用可言）
-            log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
-                % len(hold), level="WARN", tag="chat")
+            _kind = "marker_only" if _marker_only_echo(hold) else "partial_array"
+            log("dropped truncated leaked tool-call echo (%d chars, %s, "
+                "tools_declared=%d) — failing the turn closed (issue #72)"
+                % (len(hold), _kind, len(allowed_names)),
+                level="WARN", tag="chat")
+            raise EmptyToolEcho(len(hold), _kind)
         elif _tool_echo_droppable(hold, allowed_names):
             # issue #11：模型把 [工具结果...] 回声块当正文吐出（自造闭标记或
             # 未闭合的截断块）——吞掉，不还原（需 tool_call_id 配对）。
@@ -6316,6 +6318,54 @@ def _sse_recover_tool_tags(frames, allowed_names=None):
                + "\n\n").encode("utf-8")
 
 
+# 模型偶发把工具调用写成正文（真实 Claude 会话）。这不是可执行
+# 协议：不能猜测执行命令，也不能返回正常 stop 让客户端误判任务完成。
+_NAMED_TOOL_ECHO_RE = re.compile(
+    r"(?m)^[ \t]*\[([A-Za-z_][A-Za-z0-9_.:\-]*)[ \t]+工具调用\]\s*(?=[{\[])"
+)
+
+
+def _raise_unstructured_tool_echo(text, allowed_names):
+    if not allowed_names:
+        return
+    for match in _NAMED_TOOL_ECHO_RE.finditer(_outside_fences(text)):
+        if match.group(1) in allowed_names:
+            log("unstructured named tool-call echo — failing the turn closed",
+                level="WARN", tag="chat")
+            raise EmptyToolEcho(len(text), "unstructured_tool_call")
+
+
+def _sse_guard_unstructured_tool_echo(frames, allowed_names=None):
+    """正文里的伪工具调用必须在发送成功收尾前报错；正文仍即时输出。"""
+    if not allowed_names:
+        yield from frames
+        return
+    content, deferred = [], []
+    has_calls = False
+    for raw in frames:
+        finish = False
+        try:
+            text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+            payload = json.loads(strip_data_prefix(text))
+            for choice in payload.get("choices") or []:
+                delta = choice.get("delta") or {}
+                piece = delta.get("content")
+                if isinstance(piece, str):
+                    content.append(piece)
+                has_calls = has_calls or bool(delta.get("tool_calls"))
+                finish = finish or bool(choice.get("finish_reason"))
+        except (ValueError, TypeError, AttributeError):
+            pass
+        if finish or deferred:
+            # 连同 usage / [DONE] 保持原顺序；失败时绝不先发成功的 finish。
+            deferred.append(raw)
+        else:
+            yield raw
+    if not has_calls:
+        _raise_unstructured_tool_echo("".join(content), allowed_names)
+    yield from deferred
+
+
 def recover_leaked_tool_calls(frames, allowed_names=None):
     """流式出口：回读（issue #8 / #51 / #137）+ **tool_call id 保证**（issue #47）
     + 截断参数守卫（issue #112）。
@@ -6329,7 +6379,8 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
     tagged = _sse_recover_tool_tags(dsml, allowed_names)
     with_ids = _sse_fill_tool_call_ids(tagged)
     named = _sse_guard_nameless_tool_calls(with_ids)
-    for frame in _sse_guard_truncated_tool_args(named):
+    checked = _sse_guard_truncated_tool_args(named)
+    for frame in _sse_guard_unstructured_tool_echo(checked, allowed_names):
         yield frame
 
 
@@ -6512,21 +6563,17 @@ _STRUCTURED_LOG_ONCE = {"done": False}
 
 
 def _structured_realms():
-    """auto 模式下允许启用结构化历史的出口（默认仅 cn = 旧行为）。
+    """auto 模式允许结构化历史的出口，默认 cn + intl。
 
-    issue #137 后续：INTL 此前因「未取得端到端验证」被排除，于是 INTL 会话一直
-    走文本化历史 —— 网关把 `[assistant 请求调用工具] + JSON` 写进 assistant 消息，
-    模型照着复述，轻则整轮 502（issue #72 的 marker_only），重则客户端拿到协议
-    正文。实测（本机 intl 账号 + DeepSeek-Flash）结构化直传完全被上游接受：
-    返回原生 tool_calls、正文为空。要启用：
-        QD_STRUCTURED_TOOL_HISTORY_REALMS=cn,intl
-    默认值不变，避免影响未验证的环境。
+    国际区 GLM-5.3 已实测接受配对的 assistant.tool_calls / role:tool，
+    继续文本化会让模型照抄历史信封并静默结束。provider 白名单与 id 守卫
+    仍由 structured_tool_history_enabled 控制；显式设为 cn 可回退旧范围。
     """
     raw = os.environ.get("QD_STRUCTURED_TOOL_HISTORY_REALMS")
     if raw is None or not raw.strip():
-        return {"cn"}
+        return {"cn", "intl"}
     out = {p.strip().lower() for p in raw.split(",") if p.strip()}
-    return out or {"cn"}
+    return out or {"cn", "intl"}
 
 
 def _structured_mode():
@@ -6564,9 +6611,8 @@ def structured_tool_history_enabled(model="", model_key="", realm="",
 
     - off          -> False（一键回退文本化）
     - on           -> True（显式强制：DeepSeek / Kimi / INTL 补验证用）
-    - auto（默认） -> 仅「CN 出口 + provider 白名单 + id 齐备」为真：
-        task-31 实测只在 CN / legacy 通道覆盖过（INTL 超时未取得结果），
-        故 auto 不在 INTL 启用；DeepSeek / Kimi 待补端到端验证，同样排除。
+    - auto（默认） -> 「允许的出口 + provider 白名单 + id 齐备」为真：
+        默认允许 CN / INTL；QD_STRUCTURED_TOOL_HISTORY_REALMS 可缩小范围。
     任何模式下 id 不齐备都回退文本化（fail-safe：宁可少用，不发畸形请求）。
     """
     if not _tool_ids_ok(messages):
@@ -6997,7 +7043,7 @@ def _realm_ready_total(realm, model=None):
         return 1
 
 
-def _short_error_cooldown_wait(realm, model, exclude=None):
+def _short_error_cooldown_wait(realm, model, exclude=None, allowed_uids=None):
     """账号级短冷却（含**预算内**的模型级频控窗）的最短剩余秒数；不适用返回 0。
 
     两条冷却来源**一起收集、取最小值**（#29 起）：
@@ -7019,7 +7065,7 @@ def _short_error_cooldown_wait(realm, model, exclude=None):
     for a in POOL.accounts:
         if a.realm != realm or not a.enabled or not a.access_token:
             continue
-        if a.uid in exclude:
+        if a.uid in exclude or (allowed_uids is not None and a.uid not in allowed_uids):
             continue
         m_remain = a.model_cooldowns.get(model, 0.0) - now
         if m_remain > 0:
@@ -8267,6 +8313,7 @@ class PayloadTooLarge(UpstreamStatus):
 # 不能避的：额度归属、组织后台可见性、席位被回收、以及条款层面的问题。
 # ---------------------------------------------------------------------------
 _CLIENT_CTX = threading.local()
+_ADMIN_JOBS = qoder_admin.JobRegistry()
 _TEAM_GUARD_LOG = {"warned_wait": False, "ips": {}}
 
 
@@ -8561,6 +8608,24 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
     if usage_ctx is None:
         usage_ctx = {}
     model = str(payload.get("model") or "")
+    route = None
+    allowed_uids = None
+    if POOL is not None:
+        entry = usage_ctx.get("_key_entry") or getattr(_CLIENT_CTX, "key_entry", None) or {}
+        if only_account is None or entry:
+            try:
+                route = qoder_routing.resolve(ACCOUNTS_DIR, list(POOL.accounts), model,
+                    key=entry, explicit_realm=target_realm)
+            except ValueError as error:
+                raise UpstreamStatus(503, "routing configuration error: " + str(error))
+            allowed_uids = route["allowed_uids"]
+            if allowed_uids is not None and not allowed_uids:
+                raise UpstreamStatus(403, "API Key / routing account scope has no eligible account")
+            if route["realm"]:
+                target_realm = route["realm"]
+            usage_ctx["route_rule"] = (route["matched"] or {}).get("id") or ""
+            if only_account is not None and allowed_uids is not None and only_account.uid not in allowed_uids:
+                raise UpstreamStatus(403, "account is outside API Key / routing scope")
     # issue #128：整段对话复用同一上游会话身份（拿不到就 None = 旧行为）
     _conv = conversation_identity(payload, session_key)
     if only_account is not None and not target_realm:
@@ -8569,7 +8634,14 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
     realm = target_realm or detect_model_realm(model) or CURRENT_REALM
     if not target_realm:
         # 步2：只在**用户没显式指定**时，按账号可用性兜底换区
-        realm = fallback_realm_by_accounts(realm, model)
+        if POOL and allowed_uids is not None:
+            other = "intl" if realm == "cn" else "cn"
+            if (POOL.count_ready(realm, model=model, allowed_uids=allowed_uids) == 0
+                    and POOL.count_ready(other, model=model, allowed_uids=allowed_uids) > 0
+                    and not exclusive_realm(model)):
+                realm = other
+        else:
+            realm = fallback_realm_by_accounts(realm, model)
         if realm != CURRENT_REALM:
             # #26：换区可见（覆盖所有自动路径：独占表 / 清单驱动 / 账号回退）
             log("request routed to realm %s (default=%s, model=%r)"
@@ -8581,7 +8653,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
 
     # issue #86：钉死账号时用它构造请求体（身份类字段必须与被测号一致）
     representative = (only_account if only_account is not None
-                      else (POOL.pick(realm=realm) if POOL else None))
+                      else (POOL.pick(realm=realm, **({"allowed_uids": allowed_uids}
+                           if allowed_uids is not None else {})) if POOL else None))
     body_obj = build_qoder_body(payload, representative, model_key, realm=realm,
                                   conversation=_conv)
     if usage_ctx is not None:
@@ -8606,6 +8679,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         raise PayloadTooLarge(_size, MAX_UPSTREAM_BODY_BYTES)
 
     client_session_key = session_key
+    route_policy_active = bool(route and (route.get("configured") or route.get("tiers"))) and only_account is None
+    route_policy = route.get("policy", {}) if route_policy_active else {}
     if not session_key:
         session_key = derive_affinity_key(body_obj.get("messages"))
         if session_key and AFFINITY_DEBUG:
@@ -8614,7 +8689,15 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
 
     # issue #86：钉死账号按单账号池处理（冷却压到 3s、不跨号轮换）
     total = 1 if only_account is not None else _realm_ready_total(realm, model)
+    if only_account is None and POOL and allowed_uids is not None:
+        total = POOL.count_ready(realm, model=model, allowed_uids=allowed_uids)
     tried = set()
+    route_round = 0
+    route_round_retries = route_policy.get("request_retry", 0)
+    route_account_cap = route_policy.get("max_retry_accounts", 0)
+    route_affinity_key = session_key if route_policy.get("session_affinity", True) else None
+    route_round_size = min(total, route_account_cap) if route_account_cap else total
+    route_iteration_budget = (max(1, route_round_size)+2)*(1+route_round_retries) if route_policy_active else total+2
     last_error = None
     last_429 = None
     last_429_detail = ""
@@ -8632,17 +8715,28 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
 
     # 额外 +2 次迭代预算：只供“短错误冷却等待续上”使用（正常轮换仍由
     # tried 集合自然终止）。
-    for _ in range(total + 2):
+    for _ in range(route_iteration_budget):
         if only_account is not None:
             # issue #86：账号测试必须落在被点的那个号上，不能走会话粘性/轮询
             account = only_account if only_account.uid not in tried else None
         else:
-            account = POOL.pick_for_session(realm=realm, session_key=session_key,
-                                            exclude=tried, model=model) if POOL else None
+            if route_account_cap and len(tried) >= route_account_cap:
+                account = None
+            elif route is not None and (route["matched"] or allowed_uids is not None or route_policy_active):
+                account = qoder_routing.pick(POOL, route, realm, model, route_affinity_key, tried) if POOL else None
+            else:
+                account = POOL.pick_for_session(realm=realm, session_key=session_key,
+                                                exclude=tried, model=model) if POOL else None
         if account is None:
-            if not waited_cool:
+            if route_policy_active and route_round < route_round_retries and tried:
+                route_round += 1
+                tried.clear()
+                waited_cool = False
+                usage_ctx["routing_round"] = route_round
+                continue
+            if not waited_cool and (not route_account_cap or len(tried) < route_account_cap):
                 wait = _short_error_cooldown_wait(realm, model,
-                                                  exclude=tried)
+                    exclude=tried, **({"allowed_uids": allowed_uids} if allowed_uids is not None else {}))
                 if wait > 0:
                     waited_cool = True
                     log("accounts in short error-cooldown for '%s' "
@@ -9312,18 +9406,13 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
             elif _leaked_partial_droppable(_echo_src, allowed_names):
                 # issue #72：声明了 tools 却只拿到残缺回声 -> fail-closed（502），
                 # 不再把「空调用 + 正常内容」当成成功返回。
-                if allowed_names and _marker_only_echo(_echo_src):
-                    _kind72 = ("marker_only" if _marker_only_echo(_echo_src)
-                               else "partial_array")
-                    log("dropped truncated leaked tool-call echo (%d chars, %s, "
-                        "tools_declared=%d) — failing the turn closed (issue #72)"
-                        % (len(_echo_src), _kind72, len(allowed_names)),
-                        level="WARN", tag="chat")
-                    raise EmptyToolEcho(len(_echo_src), _kind72)
-                # issue #9：截断的 marker+JSON 回声不还原、也不透传。
-                log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
-                    % len(_echo_src), level="WARN", tag="chat")
-                message["content"] = _head16
+                _kind72 = ("marker_only" if _marker_only_echo(_echo_src)
+                           else "partial_array")
+                log("dropped truncated leaked tool-call echo (%d chars, %s, "
+                    "tools_declared=%d) — failing the turn closed (issue #72)"
+                    % (len(_echo_src), _kind72, len(allowed_names)),
+                    level="WARN", tag="chat")
+                raise EmptyToolEcho(len(_echo_src), _kind72)
             elif _tool_echo_droppable(_echo_src, allowed_names):
                 # issue #11：工具结果回声块同样不还原、不透传。
                 log("dropped leaked tool-result echo (%d chars) — issue #11"
@@ -9397,6 +9486,8 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
         else:
             _log_unrecovered_leak(message.get("content") or "",
                                   "aggregate-tool-tag")
+    if not tool_calls_map:
+        _raise_unstructured_tool_echo(message.get("content") or "", allowed_names)
     # 二次防御：剔除「无函数名」的空 tool_call，防止客户端死等
     if tool_calls_map:
         tool_calls_map = {k: v for k, v in tool_calls_map.items()
@@ -10373,6 +10464,8 @@ def stream_responses_events(inner_lines, model, holder):
                  {"output_index": entry["output_index"], "item": fc_item})
     # 冲刷剩余缓冲文本
     if text_buffer:
+        if not tool_calls_map and not dsml_tool_calls:
+            _raise_unstructured_tool_echo(text_buffer, holder.get("allowed_names"))
         leak_calls, leak_clean = (None, text_buffer)
         dropped_leak = False
         dropped_tool_echo = False
@@ -10405,18 +10498,13 @@ def stream_responses_events(inner_lines, model, holder):
             # issue #72：客户端声明了 tools、本轮又没恢复出任何调用时，
             # **不能以 response.completed 收尾**（agent 会误判任务完成）。
             _allowed72 = holder.get("allowed_names") or set()
-            if _allowed72 and _marker_only_echo(text_buffer):
-                _kind72 = ("marker_only" if _marker_only_echo(text_buffer)
-                           else "partial_array")
-                log("dropped truncated leaked tool-call echo (%d chars, %s, "
-                    "tools_declared=%d) — failing the turn closed (issue #72)"
-                    % (len(text_buffer), _kind72, len(_allowed72)),
-                    level="WARN", tag="chat")
-                raise EmptyToolEcho(len(text_buffer), _kind72)
-            # issue #9：截断的 marker+JSON 回声 -> 不输出文本、不走 DSML 回退。
-            log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
-                % len(text_buffer), level="WARN", tag="chat")
-            calls_rem, clean_rem = None, None
+            _kind72 = ("marker_only" if _marker_only_echo(text_buffer)
+                       else "partial_array")
+            log("dropped truncated leaked tool-call echo (%d chars, %s, "
+                "tools_declared=%d) — failing the turn closed (issue #72)"
+                % (len(text_buffer), _kind72, len(_allowed72)),
+                level="WARN", tag="chat")
+            raise EmptyToolEcho(len(text_buffer), _kind72)
         elif dropped_tool_echo:
             # issue #11：工具结果回声块 -> 同样吞掉，不走 DSML 回退。
             log("dropped leaked tool-result echo (%d chars) — issue #11"
@@ -10937,6 +11025,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authorized(self):
         if self._key_ok():
+            _CLIENT_CTX.key_entry = getattr(self, "key_entry", None)
             return True
         self._error(401, "invalid api key", "invalid_request_error")
         return False
@@ -10968,6 +11057,8 @@ class Handler(BaseHTTPRequestHandler):
         Model listings stay reachable with the API key alone so that plain
         OpenAI clients can keep discovering models.
         """
+        if path.startswith("/admin"):
+            return True
         if path.startswith("/accounts"):
             return True
         if path.startswith("/usage") or path.startswith("/v1/usage"):
@@ -11004,6 +11095,7 @@ class Handler(BaseHTTPRequestHandler):
         # 会带回上一次 chat 的残留值 —— 那会让面板把「上一次的出口」当成「本次的」。
         self.realm_used = ""
         self.realm_reason = ""
+        _CLIENT_CTX.key_entry = None
         # issue #56：记录客户端 IP（团队账号的「是否被共用」统计用）
         try:
             _CLIENT_CTX.ip = self.client_address[0]
@@ -11015,6 +11107,8 @@ class Handler(BaseHTTPRequestHandler):
         if self._is_panel_route(path) and not self._panel_ok():
             return self._error(401, "panel password required",
                                "invalid_request_error")
+        if path.startswith("/admin/"):
+            return self._handle_admin_get(path, query)
         if path in ("/", "/dashboard", "/ui"):
             return self._dashboard()
         if path == "/i18n/manifest":
@@ -11069,6 +11163,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, qoder_agents.overview(ACCOUNTS_DIR))
             except qoder_agents.AgentConfigError as exc:
                 return self._error(500, str(exc))
+        if path == "/agents/template":
+            try:
+                return self._json(200, qoder_agents.template(
+                    str((query.get("client") or [""])[0]),
+                    str((query.get("base_url") or ["http://127.0.0.1:8790"])[0]),
+                    model=str((query.get("model") or ["auto"])[0])))
+            except qoder_agents.AgentConfigError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
         if path == "/agents/models":
             # 网关自己的模型清单（面板配置页预填用；与 /v1/models 同源字段）
             if not self._authorized():
@@ -11863,8 +11965,13 @@ class Handler(BaseHTTPRequestHandler):
                     # qoder_settings._clean_key_entry 一处完成）。
                     "models": models_val,
                     "note": note_val,
+                    "account_ids": item.get("account_ids", _prev.get("account_ids") or []),
+                    "account_groups": item.get("account_groups", _prev.get("account_groups") or []),
                 })
-            qoder_settings.set_api_keys(ACCOUNTS_DIR, cleaned)
+            try:
+                qoder_settings.set_api_keys(ACCOUNTS_DIR, cleaned)
+            except ValueError as error:
+                return self._error(400, str(error), "invalid_request_error")
             reply["api_keys_saved"] = len(cleaned)
         if "banned_models" in payload:
             # P1-4：全局封禁列表（逗号/分号/换行分隔均可，清洗在 qoder_settings）。
@@ -11999,6 +12106,148 @@ class Handler(BaseHTTPRequestHandler):
         return self._unknown_path_error(path)
 
     # issue #121：/diag/model-billing 已移除——上游对网关身份一律回报 "auto"，    # 该字段不携带计费信息，据此提示用户只会误导（用户实测国际版同样如此）。
+    def _admin_account_views(self):
+        return [a.public() for a in (POOL.accounts if POOL else [])]
+
+    def _handle_admin_get(self, path, query):
+        accounts = list(POOL.accounts) if POOL else []
+        if path == "/admin/overview":
+            stamp = _usage_log_fingerprint()
+            metadata = tuple((a.uid, a.nickname, getattr(a, "group", ""), a.realm,
+                              bool(a.enabled), bool(a.access_token), a.cooldown_until,
+                              a.expires_at) for a in accounts)
+            now = time.time()
+            key = ("admin-overview", stamp, int(now//10), metadata)
+            result = _USAGE_REPORT_CACHE.get(key, lambda: qoder_admin.build_overview(
+                _iter_usage_rows_forward(now-6*3600-600), accounts, now=now), ttl=10,
+                valid=lambda: _usage_log_fingerprint() == stamp)
+            result.update(version=VERSION, realm=CURRENT_REALM,
+                          keys=sum(k.get("enabled", True) is not False for k in configured_keys()),
+                          models=len({qoder_catalog.display_id(m) for r in ("cn", "intl")
+                                      for m in qoder_catalog.models_for_realm(r)}),
+                          routing_rules=len(qoder_routing.load_rules(ACCOUNTS_DIR)),
+                          log_dir=LOG_DIR, uptime_seconds=max(0, int(now-STARTED_AT)))
+            return self._json(200, result)
+        if path == "/admin/groups":
+            return self._json(200, {"ok": True, "groups": qoder_admin.groups_view(accounts),
+                                    "accounts": self._admin_account_views()})
+        if path == "/admin/routing":
+            try:
+                config = qoder_routing.load_config(ACCOUNTS_DIR)
+            except ValueError as error:
+                return self._error(500, str(error), "configuration_error")
+            return self._json(200, dict(config, ok=True,
+                                    models=[{"id":mid,"realm":r} for r in ("cn","intl") for mid in qoder_catalog.display_names(r)],
+                                    strategies=list(qoder_routing.STRATEGIES),
+                                    groups=qoder_admin.groups_view(accounts),
+                                    accounts=self._admin_account_views()))
+        if path == "/admin/jobs":
+            value = _ADMIN_JOBS.get((query.get("id") or [""])[0])
+            if not value:
+                return self._error(404, "job not found", "invalid_request_error")
+            return self._json(200, {"ok": True, "job": value})
+        return self._unknown_path_error(path)
+
+    def _admin_test_account(self, account):
+        model = _default_test_model(account.realm)
+        started = time.time()
+        try:
+            response, used, _ = open_upstream({"model": model, "max_tokens": 32,
+                "messages": [{"role": "user", "content": "hi"}]},
+                target_realm=account.realm, only_account=account)
+            with response:
+                obj = aggregate_stream(response, model, holder={"usage": None})
+            record_usage(model, obj.get("usage"), stream=False,
+                         account=used.uid, key_id="panel-group-test",
+                         elapsed_ms=int((time.time()-started)*1000))
+            return {"ok": True, "model": model, "elapsed_ms": int((time.time()-started)*1000)}
+        except Exception as error:
+            detail = str(getattr(error, "detail", "") or getattr(error, "qoder_detail", "") or error)
+            return {"ok": False, "model": model, "error": detail[:300], "hint": _quota_hint(detail)}
+
+    def _handle_admin(self, path, payload):
+        if not isinstance(payload, dict):
+            return self._error(400, "expected a JSON object", "invalid_request_error")
+        if path == "/admin/routing/save":
+            try:
+                config = qoder_routing.save_config(ACCOUNTS_DIR,
+                    rules=payload.get("rules"), tiers=payload.get("tiers"),
+                    policy=payload.get("policy"), expected_revision=payload.get("revision"))
+            except ValueError as error:
+                return self._error(400, str(error), "invalid_request_error")
+            return self._json(200, dict(config, ok=True))
+        if path == "/admin/routing/preview":
+            key_id = str(payload.get("key_id") or "")
+            key = next((k for k in configured_keys() if k.get("id") == key_id), None)
+            if key_id and key is None:
+                return self._error(404, "API Key not found", "invalid_request_error")
+            try:
+                result = qoder_routing.preview(ACCOUNTS_DIR, list(POOL.accounts) if POOL else [],
+                    str(payload.get("model") or "auto"), key=key,
+                    realm=(payload.get("realm") or (key or {}).get("realm")
+                           or exclusive_realm(str(payload.get("model") or "auto"))),
+                    fallback_realm=detect_model_realm(str(payload.get("model") or "auto")) or CURRENT_REALM,
+                    config=({"rules": qoder_routing.normalize_rules(payload["draft"].get("rules", [])),
+                             "tiers": qoder_routing.normalize_tiers(payload["draft"].get("tiers", [])),
+                             "policy": qoder_routing.normalize_policy(payload["draft"].get("policy")),
+                             "configured": True, "board_enabled": True} if isinstance(payload.get("draft"), dict) else None))
+            except ValueError as error:
+                return self._error(400, str(error), "invalid_request_error")
+            return self._json(200, result)
+        if POOL is None:
+            return self._error(503, "account pool unavailable")
+        if path == "/admin/accounts/group":
+            uids = payload.get("uids")
+            if not isinstance(uids, list) or not uids or len(uids) > 500:
+                return self._error(400, "uids must contain 1..500 account ids", "invalid_request_error")
+            group = payload.get("group", "")
+            if not isinstance(group, str) or len(group.strip()) > 64 or any(ord(c) < 32 for c in group):
+                return self._error(400, "invalid account group", "invalid_request_error")
+            targets = [POOL.get(str(uid)) for uid in dict.fromkeys(uids)]
+            if any(a is None for a in targets):
+                return self._error(404, "account not found", "invalid_request_error")
+            for account in targets:
+                account.group = group.strip()
+                account.save(ACCOUNTS_DIR)
+            return self._json(200, {"ok": True, "changed": len(targets),
+                                    "accounts": self._admin_account_views()})
+        if path == "/admin/groups/action":
+            if "group" not in payload or not isinstance(payload["group"], str):
+                return self._error(400, "group is required", "invalid_request_error")
+            group = payload["group"].strip()
+            action = str(payload.get("action") or "")
+            if action not in ("enable", "disable", "refresh", "test", "checkin", "credits"):
+                return self._error(400, "unsupported group action", "invalid_request_error")
+            targets = [a for a in list(POOL.accounts) if getattr(a, "group", "") == group]
+            if not targets:
+                return self._error(404, "account group is empty", "invalid_request_error")
+            if action in ("enable", "disable"):
+                for account in targets:
+                    account.enabled = action == "enable"
+                    account.save(ACCOUNTS_DIR)
+                return self._json(200, {"ok": True, "action": action, "group": group,
+                    "results": [{"uid": a.uid, "ok": True} for a in targets],
+                    "accounts": self._admin_account_views()})
+            # Snapshot only the requested group; jobs never fall back to the whole pool.
+            def worker(account):
+                if action == "test":
+                    return self._admin_test_account(account)
+                if action == "refresh":
+                    ok = account.refresh()
+                    account.save(ACCOUNTS_DIR)
+                    return {"ok": bool(ok), "error": account.last_error if not ok else ""}
+                if action == "credits":
+                    return account.fetch_credits()
+                import qoder_tasks
+                return qoder_tasks.run_checkin(account, gap=0)
+            try:
+                job_id = _ADMIN_JOBS.submit(action, group, targets, worker)
+            except RuntimeError as error:
+                return self._error(409, str(error), "conflict")
+            return self._json(202, {"ok": True, "action": action, "group": group,
+                                    "job_id": job_id, "job": _ADMIN_JOBS.get(job_id)})
+        return self._unknown_path_error(path)
+
     def _handle_credits_probe(self, payload):
         # issue #141：额度端点自动探测（主机 × 路径矩阵）。
         # 用于确认某个区域到底哪个端点有数据（INTL 的 /api/v2/quota/usage
@@ -12590,10 +12839,11 @@ class Handler(BaseHTTPRequestHandler):
                     "dryRun": True,
                     "count": len(rows),
                     "result": POOL.preview_import_rows(rows, realm=forced_realm,
+                                                       group=payload.get("group"),
                                                        overwrite=overwrite),
                     "accounts": account_views(),
                 })
-            report = POOL.import_rows(rows, realm=forced_realm,
+            report = POOL.import_rows(rows, realm=forced_realm, group=payload.get("group"),
                                       overwrite=overwrite)
             log("account import: %d added, %d updated, %d skipped, %d invalid"
                 % (len(report["added"]), len(report["updated"]),
@@ -12662,7 +12912,7 @@ class Handler(BaseHTTPRequestHandler):
         # 而选号成功前它就是 None。必须在任何可能抛异常的语句之前。
         account = None
         try:
-            usage_ctx = {"tenant_scope": self._key_id_for_usage()}
+            usage_ctx = {"tenant_scope": self._key_id_for_usage(), "_key_entry": getattr(self, "key_entry", None)}
             blocked = self._model_precheck(chat_req.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
@@ -12873,7 +13123,7 @@ class Handler(BaseHTTPRequestHandler):
         session_key = extract_session_key(self.headers, payload)
         messages = list(chat_req.get("messages") or [])
         realm = self._request_realm()
-        usage_ctx = {"tenant_scope": self._key_id_for_usage()}
+        usage_ctx = {"tenant_scope": self._key_id_for_usage(), "_key_entry": getattr(self, "key_entry", None)}
         obj = None
         rounds = 0
         _acc = {}          # 多轮消耗累加（issue #131-3）
@@ -12997,7 +13247,7 @@ class Handler(BaseHTTPRequestHandler):
         account = None
         try:
             req_realm = self._request_realm()
-            usage_ctx = {"tenant_scope": self._key_id_for_usage()}          # P1-3：推理档位审计出参（下传给 open_upstream）
+            usage_ctx = {"tenant_scope": self._key_id_for_usage(), "_key_entry": getattr(self, "key_entry", None)}          # P1-3：推理档位审计出参（下传给 open_upstream）
             blocked = self._model_precheck(chat_req.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
@@ -13306,12 +13556,20 @@ class Handler(BaseHTTPRequestHandler):
         # chat 的出口/原因带到别的响应上。
         self.realm_used = ""
         self.realm_reason = ""
+        _CLIENT_CTX.key_entry = None
         # issue #56：记录客户端 IP（团队账号「是否被共用」统计用）
         try:
             _CLIENT_CTX.ip = self.client_address[0]
         except Exception:
             pass
         path = self.path.split("?")[0]
+        if path.startswith("/admin/"):
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            body = self._payload_or_error()
+            if body is None:
+                return
+            return self._handle_admin(path, body)
         if path == "/accounts/note":
             # issue #69：账号备注（面板内直接编辑；纯展示字段，不参与路由判定）
             if not self._panel_ok():
@@ -13442,6 +13700,9 @@ class Handler(BaseHTTPRequestHandler):
             if not self._panel_ok():
                 return self._error(401, "panel password required",
                                    "invalid_request_error")
+            payload = self._payload_or_error()
+            if payload is None:
+                return
             return self._handle_credits_probe(payload)
         if path == "/settings/save":
             if not self._panel_ok():
@@ -13562,7 +13823,7 @@ class Handler(BaseHTTPRequestHandler):
         account = None
         try:
             req_realm = self._request_realm()
-            usage_ctx = {"tenant_scope": self._key_id_for_usage()}          # P1-3：推理档位审计出参（下传给 open_upstream）
+            usage_ctx = {"tenant_scope": self._key_id_for_usage(), "_key_entry": getattr(self, "key_entry", None)}          # P1-3：推理档位审计出参（下传给 open_upstream）
             blocked = self._model_precheck(model, req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
@@ -13921,6 +14182,13 @@ def main():
                     help="write the server PID to this file (stop.bat uses it; "
                          "removed on exit)")
     args = ap.parse_args()
+    qoder_logpaths.install_stream_logging(os.path.dirname(os.path.abspath(__file__)))
+    if not args.usage_dir and not os.environ.get("QD_PROXY_USAGE_DIR"):
+        _migration = qoder_logpaths.migrate_legacy_usage(
+            os.path.dirname(os.path.abspath(__file__)), USAGE_DIR)
+        if _migration["copied"] or _migration["conflicts"]:
+            log("legacy usage preserved: copied=%s conflicts=%s" %
+                (_migration["copied"], _migration["conflicts"]), tag="system")
 
     # issue #50：把 PID 落盘，交给 stop.bat 精确停止（只认这个 PID + 命令行
     # 校验，绝不做「杀掉所有 python」那种模糊匹配）。

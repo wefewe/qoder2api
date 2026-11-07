@@ -1084,6 +1084,11 @@ function lookup(src, depth){
     if(MSG.hasOwnProperty(q)) return MSG[q];
     if(FRG.hasOwnProperty(q)) return FRG[q];
   }
+  if(d < MAX_SLOT_DEPTH && /[\r\n]/.test(src)){
+    var lines = src.split(/(\r?\n)/);
+    var mapped = lines.map(function(line){ return /[\r\n]/.test(line) ? line : lookup(line, d + 1); }).join('');
+    if(mapped !== src) return mapped;
+  }
   if(CJK.test(t)){
     for(var k in PAT){
       /* 编译缓存必须放在 PAT 之外：PAT[k] 是译文字符串本身，给字符串挂属性在
@@ -1173,16 +1178,19 @@ var WATCH_ATTRS = ['title', 'placeholder', 'aria-label'];
  * 一轮的最大变更源；<code>/<pre> 是命令与配置示例，翻了就不可用。
  * .no-i18n 给语言下拉自己用（母语名不能被翻成别的语言）。 */
 var SKIP_SEL = '.log-line, code, pre, .no-i18n';
-var seen = (typeof WeakSet === 'function') ? new WeakSet() : null;
+var seen = (typeof WeakMap === 'function') ? new WeakMap() : null;
 
 function skippable(el){
   return !!(el && el.closest && el.closest(SKIP_SEL));
 }
 
 function applyText(n){
-  if(seen){ if(seen.has(n)) return; seen.add(n); }
+  // A reused text node may receive new Chinese content after polling or animation.
+  // Cache its last value, not merely its identity, or dynamic text stays untranslated.
+  if(seen && seen.get(n) === n.nodeValue) return;
   var out = t(n.nodeValue);
   if(out !== n.nodeValue) n.nodeValue = out;
+  if(seen) seen.set(n, n.nodeValue);
 }
 
 function applyAttrs(el){
@@ -3052,6 +3060,32 @@ body{background:var(--bg-secondary);color:var(--text-primary)}body>header{min-he
 @media(max-width:600px){#pageAgents>section{padding:18px}.agent-catalog-tools>*{width:100%;max-width:none!important}.agent-client-card{padding:15px}.agent-template-head h3{font-size:15px}}
 @media(prefers-reduced-motion:reduce){.agent-client-card{transition:none;transform:none!important}}
 
+
+.model-catalog-toolbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin:0 0 22px;padding:16px 18px;border:1px solid var(--border-color);border-radius:14px;background:var(--bg-secondary)}
+.model-catalog-toolbar p{margin:0;font-size:12px;color:var(--text-tertiary);line-height:1.7}.model-catalog-toolbar #modelCatalogState{margin-left:auto;font:11px ui-monospace,monospace;color:var(--text-secondary)}
+#pageModels .model-catalog-realms{display:flex;gap:3px;padding:3px;border-radius:10px;background:var(--bg-tertiary);flex:none}#pageModels .model-catalog-realms button{background:transparent;color:var(--text-secondary);border:1px solid transparent;border-radius:8px;min-height:34px;padding:7px 13px;font-size:12px;box-shadow:none}#pageModels .model-catalog-realms button.active{background:var(--bg-secondary);border-color:var(--border-color);color:var(--text-primary);font-weight:650;box-shadow:0 1px 3px #0000000d}
+@media(max-width:680px){.model-catalog-toolbar{padding:12px;gap:10px}.model-catalog-toolbar #modelCatalogState{margin-left:0}.model-catalog-toolbar p{flex-basis:100%;order:3}#pageModels .model-catalog-realms{max-width:100%;flex-wrap:wrap}}
+
+</style>
+<style id="account-quota-layout">
+.account-credit-cell{min-width:210px;width:230px;white-space:normal}
+.account-quota{display:grid;gap:6px;max-width:250px}
+.account-quota-caption,.account-quota-meta,.account-quota-breakdown{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.account-quota-caption{color:var(--dim);font-size:10px}
+.account-quota-kind{padding:1px 6px;border:1px solid var(--line);border-radius:5px;font-size:10px;white-space:nowrap}
+.account-quota-numbers{display:flex;align-items:baseline;gap:6px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.account-quota-remaining{color:var(--accent2);font-size:19px;font-weight:650;line-height:1.2}
+.account-quota-limit{color:var(--dim);font-size:12px}
+.account-quota-meta,.account-quota-breakdown{color:var(--dim);font-size:11px}
+.account-quota-meta b{color:var(--fg);font-weight:550}
+.account-quota-used{display:inline-flex;align-items:baseline;gap:4px}
+.account-quota-warning{color:var(--warn)}
+.account-quota-meter{height:3px;overflow:hidden;border-radius:3px;background:var(--panel3)}
+.account-quota-meter span{display:block;height:100%;background:var(--accent2);border-radius:inherit}
+.account-quota-breakdown{justify-content:flex-start;gap:4px 10px;padding-top:4px;border-top:1px solid var(--line)}
+.account-quota-detail{color:var(--dim);font-size:10px;line-height:1.6;margin-top:4px;overflow-wrap:anywhere}
+.account-quota-footer{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-top:5px}
+.account-quota-footer .delta-chip{font-size:10px}
 </style>
 </head>
 <body>
@@ -3265,6 +3299,7 @@ body{background:var(--bg-secondary);color:var(--text-primary)}body>header{min-he
 
 <div id="pageModels" class="main-page">
 <div class="admin-page-heading"><div><div class="admin-eyebrow">MODEL CATALOG</div><h2>模型</h2><p>官方能力、上下文与模型级护栏，集中管理。</p></div><button class="sec" onclick="loadModels();loadSettings()">刷新模型</button></div>
+<div class="model-catalog-toolbar"><div class="seg model-catalog-realms" role="group" aria-label="模型目录区域"><button type="button" id="modelCatalogCn" aria-pressed="false" onclick="setModelCatalogRealm('cn')">国内版 (China)</button><button type="button" id="modelCatalogIntl" aria-pressed="false" onclick="setModelCatalogRealm('intl')">国际版 (Global)</button></div><p>仅切换模型目录，不改变网关默认出口或账号视图。</p><span id="modelCatalogState" role="status" aria-live="polite"></span></div>
   <!-- 版本模型库与能力清单 -->
   <section id="sectionModels">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
@@ -4794,23 +4829,54 @@ async function initRealm(preserveView){
 const MODELS_CACHE = {};    // realm -> data[]
 const GROWTH_CACHE = {};    // realm|uid -> /tasks 响应（含 __at 时间戳）
 
-async function loadModels(){
-  const realm = window.VIEW_REALM || "intl";
-  const hit = MODELS_CACHE[realm];
-  if(hit){                       // 1) 立即用缓存渲染
-    MODELS_DATA = hit;
-    renderAvailableModels();
+// Model catalog owns its region: viewing a model must never POST /realm or change account scope.
+let MODEL_CATALOG_REQUEST = 0;
+function getModelCatalogRealm(){
+  if(['cn','intl'].includes(window.MODEL_CATALOG_REALM)) return window.MODEL_CATALOG_REALM;
+  let selected='';
+  try{ selected=new URLSearchParams(window.location.search).get('model_realm')||''; }catch(e){}
+  if(!['cn','intl'].includes(selected)){
+    try{ selected=localStorage.getItem('qd_model_catalog_realm')||''; }catch(e){}
   }
+  if(['cn','intl'].includes(selected)) window.MODEL_CATALOG_REALM=selected;
+  return ['cn','intl'].includes(selected)?selected:(window.VIEW_REALM||'intl');
+}
+function renderModelCatalogRealm(realm, message){
+  ['cn','intl'].forEach(r=>{const button=document.getElementById(r==='cn'?'modelCatalogCn':'modelCatalogIntl');if(button){button.classList.toggle('active',r===realm);button.setAttribute('aria-pressed',String(r===realm));}});
+  const state=document.getElementById('modelCatalogState');if(state)state.textContent=(realm==='cn'?'国内版':'国际版')+' · '+message;
+}
+async function setModelCatalogRealm(realm){
+  if(!['cn','intl'].includes(realm))return;
+  window.MODEL_CATALOG_REALM=realm;
+  try{localStorage.setItem('qd_model_catalog_realm',realm);}catch(e){}
+  try{const url=new URL(window.location.href);url.searchParams.set('model_realm',realm);history.replaceState(null,'',url.pathname+url.search+url.hash);}catch(e){}
+  await loadModels();
+}
+async function loadModels(){
+  const realm = getModelCatalogRealm(), request = ++MODEL_CATALOG_REQUEST;
+  const hit = MODELS_CACHE[realm];
+  // Clear the previous region immediately: old rows must never wear the new region label.
+  MODELS_DATA = hit || [];
+  renderAvailableModels();
+  renderModelCatalogRealm(realm,hit?'显示缓存，正在刷新…':'正在加载模型…');
+  const table=document.getElementById('modelsTable');if(table)table.setAttribute('aria-busy','true');
   try{
     const r = await getJSON('/v1/models?realm=' + encodeURIComponent(realm));
-    // 2) 后台刷新；仅当用户仍停留在同一区域时覆盖界面
-    MODELS_CACHE[realm] = r.data || [];
-    if((window.VIEW_REALM || "intl") === realm){
+    if(request!==MODEL_CATALOG_REQUEST)return;
+    MODELS_CACHE[realm] = Array.isArray(r.data) ? r.data : [];
+    if(request===MODEL_CATALOG_REQUEST && getModelCatalogRealm()===realm){
       MODELS_DATA = MODELS_CACHE[realm];
       renderAvailableModels();
+      renderModelCatalogRealm(realm,'共 '+MODELS_DATA.length+' 个模型');
     }
   }catch(e){
-    console.error('loadModels error:', e);
+    if(request===MODEL_CATALOG_REQUEST && getModelCatalogRealm()===realm){
+      renderModelCatalogRealm(realm,hit?'刷新失败，显示本区域缓存':'加载失败，请重试');
+      if(!hit){const body=document.querySelector('#modelsTable tbody');if(body)body.innerHTML='<tr><td colspan="6" class="empty">模型目录加载失败，请点击刷新模型重试。</td></tr>';}
+    }
+    console.error('loadModels error:',e);
+  }finally{
+    if(request===MODEL_CATALOG_REQUEST && table)table.setAttribute('aria-busy','false');
   }
 }
 
@@ -6210,6 +6276,30 @@ function creditsDeltaChip(a){
   return '<span class="delta-chip ' + cls + '" title="最近一次积分变化 ' + txt
     + (when ? ("（" + esc(when) + "）") : "") + '">' + esc(txt) + "</span>";
 }
+// 主数字按账号口径合并个人与共享额度，分项仍保留，避免重复显示共享余额。
+function accountCreditMain(cred){
+  const q = accountQuota(cred);
+  if(!q) return '<span style="color:var(--dim)">未查询</span>';
+  const kind = q.hasShared ? (q.hasPersonal ? '个人 + 共享' : '共享额度') : '个人额度';
+  const amount = q.unlimited ? '不限量' : fmt(q.remaining);
+  const limit = q.unlimited ? '' : '<span class="account-quota-limit">/ ' + (q.limit == null ? '—' : fmt(q.limit)) + '</span>';
+  let html = '<div class="account-quota"><div class="account-quota-caption"><span>剩余 / 总额度</span><span class="account-quota-kind">'
+    + kind + '</span></div><div class="account-quota-numbers"><b class="account-quota-remaining">'
+    + amount + '</b>' + limit + '</div><div class="account-quota-meta"><span>已用 <b>'
+    + (q.used == null ? '—' : fmt(q.used)) + '</b></span>'
+    + (q.sharedUnavailable ? '<span class="account-quota-warning">共享不可用</span>' : '') + '</div>';
+  if(!q.unlimited && q.limit > 0){
+    const value = Math.min(q.limit, Math.max(0, q.remaining));
+    html += '<div class="account-quota-meter" role="progressbar" aria-label="剩余额度" aria-valuemin="0" aria-valuemax="'
+      + q.limit + '" aria-valuenow="' + value + '"><span style="width:' + (100 * value / q.limit) + '%"></span></div>';
+  }
+  if(q.hasPersonal && q.hasShared){
+    html += '<div class="account-quota-breakdown"><span>个人 ' + fmt(q.personalRemain) + ' / '
+      + (q.personalLimit == null ? '—' : fmt(q.personalLimit)) + '</span><span>共享 '
+      + (q.sharedUnlimited ? '不限量' : fmt(q.sharedRemain) + ' / ' + (q.sharedLimit == null ? '—' : fmt(q.sharedLimit))) + '</span></div>';
+  }
+  return html + '</div>';
+}
 function accountRow(a){
   const realmBadge = a.realm === 'cn'
     ? '<span class="realm-badge-cn">国内版</span>'
@@ -6231,13 +6321,6 @@ function accountRow(a){
               : '<span class="badge ok">可用</span>';
   const err = a.lastError ? '<div class="hint" style="color:var(--warn);margin:2px 0 0">' + esc(a.lastError) + '</div>' : '';
   const cred = a.credits;
-  // issue #39：共享额度（团队/企业/池化）——上游返回时显示在套餐额度之后，
-  // 不返回时保持原样（不编造）。口径：套餐内 remain/size + 共享 remain。
-  const sharedTag = (cred && cred.shared && cred.shared.remain != null)
-    ? ' <span style="color:var(--dim);font-size:11px" title="共享额度（团队/企业池）：' +
-      '已用 ' + fmt(cred.shared.used) + ' · 总量 ' + fmt(cred.shared.size) + '">共享 ' +
-      fmt(cred.shared.remain) + '</span>'
-    : '';
   // issue #141 后续：额度构成就贴在该账号的积分旁边（不再要求去别处看）
   let compLine = '';
   if(cred && Array.isArray(cred.composition) && cred.composition.length){
@@ -6250,7 +6333,7 @@ function accountRow(a){
     if(part.plan) bits.push("套餐内 " + fmt(part.plan));
     if(part.pack) bits.push("资源包 " + fmt(part.pack));
     if(part.sota) bits.push("SOTA " + fmt(part.sota));
-    if(part.shared) bits.push("共享 " + fmt(part.shared));
+    if(part.shared && !cred.shared) bits.push("共享 " + fmt(part.shared));
     const exps = cred.composition.map(b => Number(b.expires_at || 0)).filter(x => x > 0);
     let expTxt = "";
     if(exps.length){
@@ -6260,14 +6343,16 @@ function accountRow(a){
         + String(d.getDate()).padStart(2, "0");
     }
     const srcTip = cred.source ? ("\n取数端点：" + cred.source) : "";
-    compLine = '<div class="mono" style="font-size:10px;color:var(--dim);margin-top:1px" title="'
-      + esc("额度构成（上游返回的容器）" + srcTip) + '">'
-      + esc(bits.join(" · ") + expTxt) + '</div>';
+    if(bits.length || expTxt){
+      compLine = '<div class="account-quota-detail" title="'
+        + esc("额度构成（上游返回的容器）" + srcTip) + '">'
+        + esc(bits.join(" · ") + expTxt) + '</div>';
+    }
   }
   // issue #40 后续：上游返回「全 0 退化体」时不再一片空白——显示 0* 并说明原因
   const degraded = a.creditsDegraded || null;
   const credText = cred
-    ? ('<b style="color:var(--accent2)">' + fmt(cred.remain) + '</b> / ' + fmt(cred.size) + sharedTag)
+    ? accountCreditMain(cred)
     : (degraded
        ? '<b style="color:var(--dim)">0*</b> <span style="color:var(--dim);font-size:11px" title="上游返回全 0 额度：' + esc(degraded.reason || '') + '（' + esc(degraded.at || '') + '）">空额度</span>'
        : '<span style="color:var(--dim)">未查询</span>');
@@ -6299,8 +6384,8 @@ function accountRow(a){
     + err + '</td>'
     + '<td style="text-align:center">' + state + _ckOff + '</td>'
     + '<td style="text-align:center;white-space:nowrap">' + accountGuardBadge(a) + '</td>'
-    + '<td style="text-align:left;white-space:nowrap">' + credText
-    +   creditsDeltaChip(a) + compLine + freshLine + '</td>'
+    + '<td class="account-credit-cell" style="text-align:left">' + credText + compLine
+    +   '<div class="account-quota-footer">' + freshLine + creditsDeltaChip(a) + '</div></td>'
     + '<td style="text-align:right">' + fmt(usage.requests) + '</td>'
     + '<td style="text-align:right">' + fmt(usage.total_tokens) + '</td>'
     + '<td style="text-align:right">' + fmt(usage.cached_tokens) + '</td>'
@@ -6373,6 +6458,28 @@ function sortAccounts(key, ev){
   renderAccounts();
 }
 
+// 账号行与排序共用同一口径；总额含成员共享限额，可用余额排除不可用池。
+function accountQuota(cred){
+  if(!cred || typeof cred !== 'object') return null;
+  const num = v => (v == null || typeof v === 'boolean' || (typeof v === 'string' && !v.trim()) || !Number.isFinite(Number(v))) ? null : Number(v);
+  const personalRemain = num(cred.remain), personalLimit = num(cred.size);
+  const personalUsed = num(cred.used) == null ? (personalLimit != null && personalRemain != null ? Math.max(0, personalLimit - personalRemain) : null) : num(cred.used);
+  const shared = cred.shared && typeof cred.shared === 'object' ? cred.shared : null;
+  const sharedRemain = shared ? num(shared.remain) : null, sharedLimit = shared ? num(shared.size) : null;
+  const sharedUsed = shared ? (num(shared.used) == null ? (sharedLimit != null && sharedLimit >= 0 && sharedRemain != null ? Math.max(0, sharedLimit - sharedRemain) : null) : num(shared.used)) : null;
+  const hasShared = !!shared && [sharedRemain, sharedLimit, sharedUsed].some(v => v != null);
+  if(![personalRemain, personalLimit, personalUsed].some(v => v != null) && !hasShared) return null;
+  const sharedUnavailable = hasShared && (shared.available === false || shared.available === 0 || (typeof shared.available === 'string' && /^(false|0|no|off)$/i.test(shared.available.trim())));
+  const sharedUnlimited = hasShared && (shared.unlimited === true || sharedLimit < 0);
+  const hasPersonal = [personalRemain, personalLimit, personalUsed].some(v => v > 0);
+  const unlimited = sharedUnlimited && !sharedUnavailable;
+  const remaining = Math.max(0, personalRemain || 0) + (hasShared && !sharedUnavailable && !sharedUnlimited ? Math.max(0, sharedRemain || 0) : 0);
+  const limit = ((!hasShared || hasPersonal) && personalLimit == null) || (hasShared && (sharedLimit == null || sharedUnlimited)) ? null : Math.max(0, personalLimit || 0) + Math.max(0, sharedLimit || 0);
+  const used = ((!hasShared || hasPersonal) && personalUsed == null) || (hasShared && sharedUsed == null) ? null : Math.max(0, personalUsed || 0) + Math.max(0, sharedUsed || 0);
+  return {remaining, limit, used, unlimited, hasPersonal, hasShared, sharedUnavailable, sharedUnlimited,
+    personalRemain: personalRemain || 0, personalLimit, sharedRemain: sharedRemain || 0, sharedLimit};
+}
+
 function acctSortValue(a, key){
   const usage = USAGE_BY_ACCOUNT[a.uid] || {};
   switch(key){
@@ -6384,8 +6491,8 @@ function acctSortValue(a, key){
                         : a.inCooldown ? 2
                         : a.lastError ? 1 : 0;
     // 两种额度口径：点击=剩余，Shift+点击=已用（issue #111）
-    case "credits":  return a.credits ? Number(a.credits.remain) : null;
-    case "used":     return a.credits ? (Number(a.credits.size) - Number(a.credits.remain)) : null;
+    case "credits": { const q = accountQuota(a.credits); return q ? (q.unlimited ? Number.MAX_VALUE : q.remaining) : null; }
+    case "used":    { const q = accountQuota(a.credits); return q ? q.used : null; }
     case "requests": return Number(usage.requests || 0);
     case "tokens":   return Number(usage.total_tokens || 0);
     case "cached":   return Number(usage.cached_tokens || 0);

@@ -74,7 +74,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2927,11 +2927,15 @@ def merge_catalog(primary, realm=None):
     out = []
     seen = set()
 
+    supplements = getattr(qoder_catalog, "CATALOG_SUPPLEMENTS", {})
+
     def wanted(mid):
         if not is_chat_model(mid):
             return False
         if primary_keys is not None and mid not in primary_keys:
-            return False      # 静态独有、官方此刻未列出的条目不外塞
+            until = supplements.get(mid)
+            if until is None or time.time() >= until:
+                return False  # 静态独有、官方此刻未列出的条目不外塞
         return True
 
     for mid in order:
@@ -13723,6 +13727,8 @@ class Handler(BaseHTTPRequestHandler):
                                         % (exc.status, _detail[:200]),
                                         "detail": _detail,
                                         "hint": _hint,
+                                        "queued": bool("10605" in _detail
+                                                       or "isQueued" in _detail),
                                         "elapsed_ms": wall_ms})
             except urllib.error.HTTPError as exc:
                 wall_ms = int((time.time() - t0) * 1000)

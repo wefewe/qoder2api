@@ -4,7 +4,7 @@
     "name": "English",
     "dir": "ltr",
     "order": 10,
-    "version": 27
+    "version": 28
   },
   "messages": {
     "国内版服务入口": "China service endpoint",
@@ -432,6 +432,10 @@
     "处理中...": "Processing...",
     "稍后再来查看": "Check back later",
     "已领取": "Claimed",
+    "未新增积分": "No new credits",
+    "预算未映射": "Budget not mapped",
+    "已请求启用，沿用模型默认": "Enabled requested; model default applies",
+    "未识别的思考参数": "Unrecognized thinking setting",
     "待领奖": "Ready to claim",
     "进行中": "In progress",
     "未接取": "Not started",
@@ -1045,7 +1049,7 @@
     "已领/无可领 {0}（{1}）": "Claimed / nothing to claim: {0} ({1})",
     "失败 {0}（{1}）": "Failed: {0} ({1})",
     "{0}；明细 {1}": "{0}; details {1}",
-    "每日签到: {0}": "Daily check-in: {0}",
+    "每日签到：本次新增 {0} 积分；{1}": "Daily check-in: {0} new credits; {1}",
     "签到失败: {0}": "Check-in failed: {0}",
     "{0} 次": "{0} times",
     "阈值 {0}，余额 {1}": "Threshold {0}, balance {1}",

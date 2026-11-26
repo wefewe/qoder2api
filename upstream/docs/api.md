@@ -21,6 +21,8 @@
 
 - 指定区域：使用 `X-Realm: cn|intl` 请求头，或 `?realm=cn|intl` 查询参数；普通推理 JSON 中的 `realm` 不参与路由。Key 的区域绑定优先于请求头/查询参数，需核对实际响应区域。`/diag/queue` 的 JSON `realm` 是该诊断接口显式支持的例外，不应推广到推理接口。
 - 实际走的区域会写进响应头 `X-Qoder-Realm`；如果发生了自动切换，切换原因写进 `X-Qoder-Realm-Reason`
+- Chat Completions 请求已知目录模型时，如果上游仅回报通用标签 `auto`，响应 `model` 回显请求名。上游明确回报的其他模型名不会改写，未知/BYOK 和自动路由模型也不会改写；用量中的 `upstream_model_key` 和 `resolved_model` 始终独立记录。
+- Chat Completions 与 Responses 支持命名思考档位和显式关闭（例如 `enable_thinking: false`）。仅指定启用时沿用模型默认值；Token 预算不猜测成档位。最近请求的 `reasoning_intent` 区分未传、命名档位、关闭、默认启用、预算未映射和未识别参数；实际消耗的 `reasoning_tokens` 与请求意图是不同指标。
 
 ## 额度构成与端点自动探测
 
@@ -202,7 +204,9 @@ SIGTERM 相同的收尾路径：`server_close()` → atexit（pid 文件清理�
 | POST | `/accounts/refresh`、`/accounts/test` | 刷新 Token、测试账号 |
 | POST | `/accounts/set`、`/accounts/set-all`、`/accounts/delete` | 修改、批量修改、删除账号 |
 | GET / POST | `/accounts/credits` | 逐个账号**向上游**查询余额（会请求上游，不要用来轮询） |
-| POST | `/accounts/checkin` | 每日签到（单个或全部账号） |
+| POST | `/accounts/checkin` | 每日签到（单个或全部账号）；返回本轮新增总额 `credit_added` 和逐账号 `state`（`claimed` / `already_claimed` / `no_credit` / `failed`）。HTTP 200 只表示批次得到结果，不等于领取到账 |
+
+国内和国际账号都尝试主动领取官方活动列表标记为可领取的积分项；发放由上游活动与账号资格决定，桌面端显示的活动并不保证同一账号在网关收到相同的可领取项。没有可领取项不会猜测到账或给当前账号补签到章。
 
 ### 签到、调度与用量
 

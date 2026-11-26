@@ -6460,7 +6460,10 @@ function renderActivity(rows, summary){
         return '<tr' + _stagger(i) + '><td class="mono" style="font-size:11px">' + esc(ts) + '</td>'
           + '<td>' + esc(kindName(r.kind)) + '</td>'
           + '<td>' + esc(r.nickname || r.uid || "") + '</td>'
-          + '<td>' + (r.ok ? '<span class="badge ok">成功</span>' : '<span class="badge bad">失败</span>') + '</td>'
+          + '<td>' + (!r.ok ? '<span class="badge bad">失败</span>'
+            : (r.kind === 'checkin' && !(Number(r.amount) > 0)
+              ? '<span class="badge warn">' + (r.outcome === 'already_claimed' ? '已领取' : '未新增积分') + '</span>'
+              : '<span class="badge ok">成功</span>')) + '</td>'
           + '<td style="text-align:right">' + fmt(r.amount) + '</td>'
           + '<td class="insight-detail">' + esc(r.detail || "") + '</td></tr>';
       }).join("")
@@ -6626,7 +6629,7 @@ function checkinOutcome(x){
   const claimedList = (Array.isArray(raw) ? raw : (typeof raw === 'string' ? [raw] : []))
     .filter(v => typeof v === 'string' && v);
   const earned = Number(x.earned_credit || 0);
-  if(claimedList.length || raw === true || earned > 0){
+  if(earned > 0 || (!Object.prototype.hasOwnProperty.call(x, 'state') && (claimedList.length || raw === true))){
     const text = detail || ('领取成功' + (earned > 0 ? ' +' + earned + ' 积分' : '') +
       (claimedList.length ? '（' + claimedList.join('、') + '）' : ''));
     return { state: 'claimed', name: name, text: name + ': ' + text };
@@ -6669,7 +6672,8 @@ async function doCheckin(btn){
     if(!res.length) toast("未发现可签到账号", "warn");
     else {
       const rows = res.map(checkinOutcome);
-      toast("每日签到: " + checkinToastText(rows), checkinToastKind(rows));
+      const total = r.credit_added ?? res.reduce((n, x) => n + Number(x.earned_credit || 0), 0);
+      toast('每日签到：本次新增 ' + total + ' 积分；' + checkinToastText(rows), checkinToastKind(rows));
     }
     await initRealm(true);      // 保留当前视图（不再跳回网关默认区）
     await Promise.all([loadAccounts(), loadModels(), loadGrowthTasks({force:true})]);
@@ -7790,7 +7794,13 @@ function effortCell(r){
   const hasEff = Object.prototype.hasOwnProperty.call(r, 'reasoning_effort');
   const req = hasReq ? String(r.reasoning_effort_requested || '') : '';
   const eff = hasEff ? String(r.reasoning_effort || '') : '';
-  if(!hasReq && !hasEff) return '<span style="color:var(--dim)" title="这一行没有档位字段（旧行，或客户端未请求该参数）">—</span>';
+  if(!hasReq && !hasEff){
+    const labels = {budget_unsupported: '预算未映射', enabled_default: '已请求启用，沿用模型默认',
+                    unrecognized: '未识别的思考参数'};
+    if(Object.prototype.hasOwnProperty.call(labels, r.reasoning_intent))
+      return '<span class="badge warn">' + esc(labels[r.reasoning_intent]) + '</span>';
+    return '<span style="color:var(--dim)" title="这一行没有档位字段（旧行，或客户端未请求该参数）">—</span>';
+  }
   if(hasEff && eff === ''){
     return '<span class="badge bad" title="客户端请求 ' + esc(req || '?') + '，归一化后未下发给上游（模型无档位表或被丢弃）">' + mono(req || '?') + ' → 未下发</span>';
   }

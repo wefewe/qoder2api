@@ -5,7 +5,7 @@
 | 标记 | 含义 |
 |---|---|
 | 公开 | 不需要任何凭证 |
-| Key | 需要 API Key（`Authorization: Bearer`、`x-api-key` 或 `?key=`）。没有配置任何 Key 时也可以访问。已登录的面板会话同样可以访问 |
+| Key | 需要 API Key（`Authorization: Bearer` 或 `x-api-key`）。仅回环监听且未配置 Key 时可直接访问。已登录的面板会话同样可以访问 |
 | 面板 | 需要面板会话：先调用 `POST /panel/login` 拿到 token，之后在请求头 `X-Panel-Token` 中带上 |
 
 ## 推理
@@ -157,7 +157,7 @@ curl -sS -X POST 'http://HOST/diag/queue' \
 | POST | `/panel/login`、`/panel/logout`、`/panel/password` | 登录、登出、修改面板密码（公开） |
 | GET / POST | `/settings`、`/settings/save` | 读取 / 保存设置（API Key、限额、模型闸门等） |
 | GET | `/settings/reveal?id=` | 读取某个 Key 的明文（面板还在用默认密码时返回 403） |
-| POST | `/realm` | 切换全局出口（有 Key 即可） |
+| POST | `/realm` | 切换全局出口（仅面板会话可以修改） |
 | GET | `/logs`、`/logs/export`；POST `/logs/clear` | 运行日志 |
 | GET | `/update/check` | 检查 GitHub 上是否有新版本 |
 | POST | `/admin/shutdown` | 关闭网关进程，见下节 |
@@ -196,8 +196,9 @@ SIGTERM 相同的收尾路径：`server_close()` → atexit（pid 文件清理�
 | GET | `/accounts` | 账号列表 |
 | POST | `/accounts/login/start`、GET `/accounts/login/poll`、POST `/accounts/login/cancel` | OAuth 设备授权 |
 | POST | `/accounts/import/pat` | 导入 PAT |
-| POST | `/accounts/import/desktop` | 请求体为 `{}` 时只扫描本机凭证；带 `{"path": ...}` 时导入指定凭证；带 `{"all": true}` 时导入全部 |
-| GET | `/accounts/export`；POST `/accounts/import` | JSON 导出 / 导入 |
+| POST | `/accounts/import/desktop` | 请求体为 `{}` 时只扫描本机凭证；带 `{"path": ...}` 时只允许导入服务器扫描已发现的有效凭证；带 `{"all": true}` 时导入全部 |
+| GET | `/accounts/export` | 仅导出账号元数据；需要面板会话，不提供凭证下载 |
+| POST | `/accounts/import` | 导入账号 JSON；包含凭证的备份需在服务器终端用 `--backup-accounts` 生成 |
 | POST | `/accounts/refresh`、`/accounts/test` | 刷新 Token、测试账号 |
 | POST | `/accounts/set`、`/accounts/set-all`、`/accounts/delete` | 修改、批量修改、删除账号 |
 | GET / POST | `/accounts/credits` | 逐个账号**向上游**查询余额（会请求上游，不要用来轮询） |
